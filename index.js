@@ -4,7 +4,7 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 
 const SUPABASE_URL = 'https://atyxnuzykfhppbtsfogd.supabase.co';
-const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF0eXhudXp5a2ZocHBidHNmb2dkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDU4NjYyNjAsImV4cCI6MjA2MTQ0MjI2MH0.ImF0eXhudXp5a2ZocHBidHNmb2dkIg';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF0eXhudXp5a2ZocHBidHNmb2dkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE5NTcwNDcsImV4cCI6MjA4NzUzMzA0N30._JAkiG9WVJ_0BIMoOknWEJQCG4DQT1nLYguDj7Tt4wQ';
 
 const headers = {
   'apikey': SUPABASE_KEY,
@@ -27,14 +27,11 @@ async function savePatient(phone) {
   const queueNumber = waiting.length + 1;
 
   // Insert new patient
-  const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/patients`, {
+  await fetch(`${SUPABASE_URL}/rest/v1/patients`, {
     method: 'POST',
     headers: { ...headers, 'Prefer': 'return=representation' },
     body: JSON.stringify({ phone, queue_number: queueNumber, status: 'waiting' })
   });
-
-  const inserted = await insertRes.json();
-  console.log('Inserted:', inserted);
 
   return queueNumber;
 }
