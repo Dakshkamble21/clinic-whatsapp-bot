@@ -29,7 +29,6 @@ Please choose an option:
 
 Reply with a number (1-5)`;
 
-// ─── Session helpers ───────────────────────────────────────
 async function getSession() {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/sessions?order=id.desc&limit=1&select=*`, { headers });
   const data = await res.json();
@@ -43,13 +42,11 @@ async function setSession(status) {
   if (status === 'RUNNING' && session.status === 'IDLE') update.started_at = now;
   if (status === 'PAUSED') update.paused_at = now;
   if (status === 'CLOSED') update.closed_at = now;
-
   await fetch(`${SUPABASE_URL}/rest/v1/sessions?id=eq.${session.id}`, {
     method: 'PATCH', headers, body: JSON.stringify(update)
   });
 }
 
-// ─── Patient helpers ────────────────────────────────────────
 async function getPatientByStatus(phone, status) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(phone)}&status=eq.${status}&select=*`, { headers });
   const data = await res.json();
@@ -58,14 +55,6 @@ async function getPatientByStatus(phone, status) {
 
 async function getActivePatient(phone) {
   for (const status of ['waiting', 'running_late', 'emergency']) {
-    const p = await getPatientByStatus(phone, status);
-    if (p) return p;
-  }
-  return null;
-}
-
-async function getPendingPatient(phone) {
-  for (const status of ['pending_name', 'pending_reason', 'pending_choice']) {
     const p = await getPatientByStatus(phone, status);
     if (p) return p;
   }
@@ -90,9 +79,7 @@ async function sendWhatsApp(to, message) {
 async function notifyAllWaiting(message) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=in.(waiting,running_late)&select=*`, { headers });
   const patients = await res.json();
-  for (const p of patients) {
-    await sendWhatsApp(p.phone, message);
-  }
+  for (const p of patients) await sendWhatsApp(p.phone, message);
 }
 
 // ─── WhatsApp Webhook ───────────────────────────────────────
@@ -105,7 +92,6 @@ app.post('/webhook', async (req, res) => {
   try {
     const session = await getSession();
 
-    // ── Mid-registration flow (always allowed) ──
     const pendingName = await getPatientByStatus(from, 'pending_name');
     if (pendingName) {
       await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&status=eq.pending_name`, {
@@ -114,7 +100,6 @@ app.post('/webhook', async (req, res) => {
       reply = `Thank you, *${msg}*! 😊\n\nPlease reply with your *reason for visit*\n(e.g. fever, checkup, follow-up):`;
 
     } else if (await getPatientByStatus(from, 'pending_reason')) {
-      const pending = await getPatientByStatus(from, 'pending_reason');
       await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&status=eq.pending_reason`, {
         method: 'PATCH', headers, body: JSON.stringify({ reason: msg, status: 'pending_choice' })
       });
@@ -147,7 +132,6 @@ app.post('/webhook', async (req, res) => {
       }
 
     } else {
-      // Check appointment pending
       const apptRes = await fetch(`${SUPABASE_URL}/rest/v1/appointments?phone=eq.${encodeURIComponent(from)}&status=eq.pending_time&select=*`, { headers });
       const appts = await apptRes.json();
       if (appts.length > 0) {
@@ -158,30 +142,15 @@ app.post('/webhook', async (req, res) => {
         reply = `✅ *Appointment Confirmed!*\n\n👤 *Name:* ${appt.name}\n🩺 *Reason:* ${appt.reason}\n🕐 *Time:* ${msg}\n\nWe'll see you then! 🏥\nReply *menu* anytime for options.`;
 
       } else {
-        // ── Session state gate ──
         if (session.status === 'IDLE') {
-          reply = `🏥 *Clinic is not open yet.*\n\nThe session hasn't started. Please check back soon or message us again when the clinic opens!\n\nReply *menu* to see options when we're open.`;
-
+          reply = `🏥 *Clinic is not open yet.*\n\nThe session hasn't started. Please check back soon!\n\nReply *menu* to see options when we're open.`;
         } else if (session.status === 'CLOSED') {
-          reply = `🏥 *Today's session has ended.*\n\nThank you for visiting! Please come back tomorrow or contact us to book an appointment.\n\nReply *menu* to see options.`;
-
+          reply = `🏥 *Today's session has ended.*\n\nThank you for visiting! Please come back tomorrow or contact us to book an appointment.`;
         } else if (session.status === 'PAUSED') {
           const active = await getActivePatient(from);
-          if (msg === '2' || msgLower === 'status') {
-            if (active) {
-              const ahead = await getWaitInfo(active.queue_number);
-              reply = `⏸️ *Clinic is temporarily paused.*\n\n*${active.name}*, your token *#${active.queue_number}* is saved.\nPeople ahead: *${ahead}*\n\nWe'll resume shortly and notify you! 🏥`;
-            } else {
-              reply = `⏸️ *Clinic is temporarily paused.*\n\nWe'll be back shortly. Your token will be saved when you join.\n\nReply *menu* when we resume.`;
-            }
-          } else {
-            reply = `⏸️ *Clinic is temporarily paused.*\n\nWe'll resume shortly!\n\n${active ? `Your token *#${active.queue_number}* is saved, *${active.name}*.` : 'You can join the queue when we resume.'}\n\nReply *2* to check your status.`;
-          }
-
+          reply = `⏸️ *Clinic is temporarily paused.*\n\nWe'll resume shortly!\n\n${active ? `Your token *#${active.queue_number}* is saved, *${active.name}*.` : 'You can join the queue when we resume.'}\n\nReply *2* to check your status.`;
         } else {
-          // ── RUNNING — full menu ──
           const active = await getActivePatient(from);
-
           if (msg === '1' || msgLower === 'join') {
             if (active) {
               const ahead = await getWaitInfo(active.queue_number);
@@ -193,7 +162,6 @@ app.post('/webhook', async (req, res) => {
               });
               reply = `Let's get you registered! 📝\n\nPlease reply with your *full name*:`;
             }
-
           } else if (msg === '2' || msgLower === 'status') {
             if (active) {
               const ahead = await getWaitInfo(active.queue_number);
@@ -205,7 +173,6 @@ app.post('/webhook', async (req, res) => {
             } else {
               reply = `You are not currently in the queue.\n\n${MAIN_MENU}`;
             }
-
           } else if (msg === '3' || msgLower === 'cancel') {
             if (active) {
               await fetch(`${SUPABASE_URL}/rest/v1/patients?id=eq.${active.id}`, {
@@ -215,31 +182,28 @@ app.post('/webhook', async (req, res) => {
             } else {
               reply = `You don't have an active token to cancel.\n\n${MAIN_MENU}`;
             }
-
           } else if (msg === '4' || msgLower.includes('late')) {
             if (active) {
               await fetch(`${SUPABASE_URL}/rest/v1/patients?id=eq.${active.id}`, {
                 method: 'PATCH', headers, body: JSON.stringify({ status: 'running_late' })
               });
-              reply = `⏰ Got it, *${active.name}*! We've noted that you're running late.\n\nYour token *#${active.queue_number}* is still saved. The doctor has been notified.\n\nPlease come as soon as you can! 🏥`;
+              reply = `⏰ Got it, *${active.name}*! We've noted that you're running late.\n\nYour token *#${active.queue_number}* is still saved.\n\nPlease come as soon as you can! 🏥`;
             } else {
               reply = `You don't have an active token.\n\n${MAIN_MENU}`;
             }
-
           } else if (msg === '5' || msgLower.includes('emergency')) {
             if (active) {
               await fetch(`${SUPABASE_URL}/rest/v1/patients?id=eq.${active.id}`, {
                 method: 'PATCH', headers, body: JSON.stringify({ status: 'emergency' })
               });
-              reply = `🚨 *Emergency request sent for ${active.name}!*\n\nThe doctor has been notified. Please come to the clinic immediately.\n\nIf this is a medical emergency, call *112* right away.`;
+              reply = `🚨 *Emergency request sent for ${active.name}!*\n\nThe doctor has been notified. Please come immediately.\n\nIf life-threatening, call *112* right away.`;
             } else {
               await fetch(`${SUPABASE_URL}/rest/v1/patients`, {
                 method: 'POST', headers: { ...headers, 'Prefer': 'return=representation' },
                 body: JSON.stringify({ phone: from, status: 'emergency', queue_number: 0, name: 'Emergency Patient' })
               });
-              reply = `🚨 *Emergency registered!*\n\nPlease come to the clinic immediately. The doctor has been alerted.\n\nIf this is a life-threatening emergency, call *112* right away.`;
+              reply = `🚨 *Emergency registered!*\n\nPlease come to the clinic immediately. The doctor has been alerted.\n\nIf life-threatening, call *112* right away.`;
             }
-
           } else if (msgLower === 'menu' || msgLower === 'hi' || msgLower === 'hello' || msgLower === 'start' || msg === '0') {
             reply = MAIN_MENU;
           } else {
@@ -248,7 +212,6 @@ app.post('/webhook', async (req, res) => {
         }
       }
     }
-
   } catch (err) {
     console.error('Error:', err);
     reply = 'Sorry, something went wrong. Please try again or reply *menu*.';
@@ -258,33 +221,26 @@ app.post('/webhook', async (req, res) => {
   res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Message>${reply}</Message></Response>`);
 });
 
-// ─── Session Control Endpoints ──────────────────────────────
-app.post('/session/start', async (req, res) => {
-  await setSession('RUNNING');
-  res.json({ success: true, status: 'RUNNING' });
-});
-
+// ─── Session Controls ───────────────────────────────────────
+app.post('/session/start', async (req, res) => { await setSession('RUNNING'); res.json({ success: true }); });
 app.post('/session/pause', async (req, res) => {
   await setSession('PAUSED');
-  await notifyAllWaiting(`⏸️ *Clinic Update:* The session is temporarily paused.\n\nYour token is saved. We'll notify you when we resume! 🏥`);
-  res.json({ success: true, status: 'PAUSED' });
+  await notifyAllWaiting(`⏸️ *Clinic Update:* Session temporarily paused. Your token is saved! We'll notify you when we resume. 🏥`);
+  res.json({ success: true });
 });
-
 app.post('/session/resume', async (req, res) => {
   await setSession('RUNNING');
-  await notifyAllWaiting(`▶️ *Clinic Update:* We've resumed!\n\nThank you for your patience. Reply *2* to check your current wait time. 🏥`);
-  res.json({ success: true, status: 'RUNNING' });
+  await notifyAllWaiting(`▶️ *Clinic Update:* We've resumed! Reply *2* to check your wait time. 🏥`);
+  res.json({ success: true });
 });
-
 app.post('/session/end', async (req, res) => {
   await setSession('CLOSED');
-  await notifyAllWaiting(`🏥 *Clinic Update:* Today's session has ended.\n\nThank you for your patience. Please visit again tomorrow or contact us for an appointment.`);
+  await notifyAllWaiting(`🏥 *Clinic Update:* Today's session has ended. Thank you! Please visit again tomorrow.`);
   await fetch(`${SUPABASE_URL}/rest/v1/patients?status=in.(waiting,running_late,emergency)`, {
     method: 'PATCH', headers, body: JSON.stringify({ status: 'cancelled' })
   });
-  res.json({ success: true, status: 'CLOSED' });
+  res.json({ success: true });
 });
-
 app.post('/session/reset', async (req, res) => {
   await fetch(`${SUPABASE_URL}/rest/v1/sessions`, {
     method: 'POST', headers: { ...headers, 'Prefer': 'return=representation' },
@@ -293,14 +249,15 @@ app.post('/session/reset', async (req, res) => {
   await fetch(`${SUPABASE_URL}/rest/v1/patients?status=in.(waiting,running_late,emergency,cancelled,done)`, {
     method: 'PATCH', headers, body: JSON.stringify({ status: 'archived' })
   });
-  res.json({ success: true, status: 'IDLE' });
+  res.json({ success: true });
 });
 
-// ─── Done / Appt Done ───────────────────────────────────────
+// ─── Done / Skip / Appt Done ───────────────────────────────
 app.post('/done', async (req, res) => {
-  const { id } = req.body;
+  const { id, staffName } = req.body;
   await fetch(`${SUPABASE_URL}/rest/v1/patients?id=eq.${id}`, {
-    method: 'PATCH', headers, body: JSON.stringify({ status: 'done' })
+    method: 'PATCH', headers,
+    body: JSON.stringify({ status: 'done', handled_by: staffName || 'Staff' })
   });
   const nextRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=in.(waiting,running_late)&order=queue_number.asc&limit=1&select=*`, { headers });
   const next = await nextRes.json();
@@ -308,6 +265,32 @@ app.post('/done', async (req, res) => {
     await sendWhatsApp(next[0].phone, `🔔 *${next[0].name}*, it's your turn! Please come in now. The doctor is ready for you. 🏥`);
   }
   res.json({ success: true });
+});
+
+app.post('/skip', async (req, res) => {
+  const { id, staffName } = req.body;
+  const patRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?id=eq.${id}&select=*`, { headers });
+  const patients = await patRes.json();
+  if (patients.length === 0) return res.json({ success: false });
+  const skipped = patients[0];
+
+  const maxRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=in.(waiting,running_late)&order=queue_number.desc&limit=1&select=queue_number`, { headers });
+  const maxData = await maxRes.json();
+  const newQueueNumber = maxData.length > 0 ? maxData[0].queue_number + 1 : skipped.queue_number;
+
+  await fetch(`${SUPABASE_URL}/rest/v1/patients?id=eq.${id}`, {
+    method: 'PATCH', headers,
+    body: JSON.stringify({ queue_number: newQueueNumber, status: 'waiting', skipped_by: staffName || 'Staff' })
+  });
+  await sendWhatsApp(skipped.phone,
+    `⏭️ *${skipped.name}*, you were skipped as you weren't present.\n\nYou've been moved to *#${newQueueNumber}* in the queue.\n\nPlease come to the clinic soon! Reply *2* to check your updated wait time. 🏥`
+  );
+  const nextRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=in.(waiting,running_late)&order=queue_number.asc&limit=1&select=*`, { headers });
+  const next = await nextRes.json();
+  if (next.length > 0 && next[0].id !== id) {
+    await sendWhatsApp(next[0].phone, `🔔 *${next[0].name}*, it's your turn! Please come in now. 🏥`);
+  }
+  res.json({ success: true, newQueueNumber });
 });
 
 app.post('/appt-done', async (req, res) => {
@@ -318,10 +301,28 @@ app.post('/appt-done', async (req, res) => {
   res.json({ success: true });
 });
 
+// ─── Staff API (who's online) ───────────────────────────────
+app.post('/staff/ping', async (req, res) => {
+  const { name } = req.body;
+  if (!name) return res.json({ success: false });
+  await fetch(`${SUPABASE_URL}/rest/v1/staff_online`, {
+    method: 'POST',
+    headers: { ...headers, 'Prefer': 'resolution=merge-duplicates' },
+    body: JSON.stringify({ name, last_seen: new Date().toISOString() })
+  }).catch(() => {});
+  res.json({ success: true });
+});
+
+app.get('/staff/online', async (req, res) => {
+  const cutoff = new Date(Date.now() - 2 * 60 * 1000).toISOString(); // 2 min ago
+  const result = await fetch(`${SUPABASE_URL}/rest/v1/staff_online?last_seen=gte.${cutoff}&select=name,last_seen`, { headers })
+    .then(r => r.json()).catch(() => []);
+  res.json(result);
+});
+
 // ─── Doctor Panel ───────────────────────────────────────────
 app.get('/doctor', async (req, res) => {
   const today = new Date().toISOString().split('T')[0];
-
   const [sessionData, waitingRes, doneRes, allTodayRes, apptsRes, emergencyRes] = await Promise.all([
     getSession(),
     fetch(`${SUPABASE_URL}/rest/v1/patients?status=in.(waiting,running_late)&order=queue_number.asc&select=*`, { headers }),
@@ -344,12 +345,12 @@ app.get('/doctor', async (req, res) => {
   const sessionButtons = () => {
     if (session.status === 'IDLE') return `<button class="sess-btn green" onclick="sessionAction('start')">▶️ Start Session</button>`;
     if (session.status === 'RUNNING') return `
-      <button class="sess-btn orange" onclick="sessionAction('pause')">⏸️ Pause Session</button>
+      <button class="sess-btn orange" onclick="sessionAction('pause')">⏸️ Pause</button>
       <button class="sess-btn red" onclick="sessionAction('end')">⏹️ End Session</button>`;
     if (session.status === 'PAUSED') return `
-      <button class="sess-btn green" onclick="sessionAction('resume')">▶️ Resume Session</button>
+      <button class="sess-btn green" onclick="sessionAction('resume')">▶️ Resume</button>
       <button class="sess-btn red" onclick="sessionAction('end')">⏹️ End Session</button>`;
-    if (session.status === 'CLOSED') return `<button class="sess-btn gray" onclick="sessionAction('reset')">🔄 New Session (Next Day)</button>`;
+    if (session.status === 'CLOSED') return `<button class="sess-btn gray" onclick="sessionAction('reset')">🔄 New Session</button>`;
     return '';
   };
 
@@ -375,7 +376,10 @@ app.get('/doctor', async (req, res) => {
       <div class="patient-info">📞 ${p.phone.replace('whatsapp:', '')}</div>
       <div class="patient-info">🩺 ${p.reason || '—'}</div>
       <div class="patient-info">🕐 Arrived: ${new Date(p.created_at).toLocaleTimeString()}</div>
-      <button class="done-btn" onclick="markDone(${p.id})">✅ Done — Call Next</button>
+      <div class="btn-row">
+        <button class="done-btn" onclick="markDone(${p.id})">✅ Done</button>
+        <button class="skip-btn" onclick="skipPatient(${p.id})">⏭️ Skip</button>
+      </div>
     </div>`;
   }).join('');
 
@@ -394,29 +398,33 @@ app.get('/doctor', async (req, res) => {
 <head>
   <title>Clinic Panel</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="refresh" content="15">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f0f4f8; padding: 16px; }
-    h1 { font-size: 20px; color: #1a202c; margin-bottom: 4px; }
-    .date { font-size: 12px; color: #718096; margin-bottom: 16px; }
+    h1 { font-size: 20px; color: #1a202c; margin-bottom: 2px; }
+    .date { font-size: 12px; color: #718096; margin-bottom: 12px; }
 
-    .session-box { background: white; border-radius: 14px; padding: 16px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
-    .session-status { font-size: 22px; font-weight: 800; color: ${statusColor[session.status]}; margin-bottom: 12px; }
+    /* Staff bar */
+    .staff-bar { background: white; border-radius: 12px; padding: 12px 16px; margin-bottom: 16px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .staff-label { font-size: 12px; color: #718096; }
+    .staff-name { font-size: 14px; font-weight: 700; color: #2d3748; }
+    .staff-change { font-size: 12px; color: #3182ce; cursor: pointer; text-decoration: underline; }
+    .online-dots { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+    .dot { font-size: 11px; background: #c6f6d5; color: #276749; padding: 3px 8px; border-radius: 20px; font-weight: 600; }
+
+    .session-box { background: white; border-radius: 14px; padding: 16px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    .session-status { font-size: 20px; font-weight: 800; color: ${statusColor[session.status]}; margin-bottom: 10px; }
     .session-btns { display: flex; gap: 10px; flex-wrap: wrap; }
-    .sess-btn { flex: 1; min-width: 140px; padding: 14px; border: none; border-radius: 10px; font-size: 15px; font-weight: 600; cursor: pointer; color: white; }
-    .sess-btn.green { background: #38a169; }
-    .sess-btn.orange { background: #dd6b20; }
-    .sess-btn.red { background: #e53e3e; }
-    .sess-btn.gray { background: #718096; }
+    .sess-btn { flex: 1; min-width: 120px; padding: 13px; border: none; border-radius: 10px; font-size: 14px; font-weight: 600; cursor: pointer; color: white; }
+    .sess-btn.green{background:#38a169} .sess-btn.orange{background:#dd6b20} .sess-btn.red{background:#e53e3e} .sess-btn.gray{background:#718096}
 
-    .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 20px; }
+    .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 16px; }
     .stat { background: white; border-radius: 12px; padding: 14px; text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
     .stat .num { font-size: 28px; font-weight: 700; }
     .stat .lbl { font-size: 11px; color: #718096; margin-top: 2px; }
     .blue{color:#3182ce} .orange{color:#dd6b20} .green{color:#38a169} .red{color:#e53e3e}
 
-    .section-title { font-size: 13px; font-weight: 600; color: #718096; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; margin-top: 20px; }
+    .section-title { font-size: 13px; font-weight: 600; color: #718096; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; margin-top: 16px; }
     .patient-card { background: white; border-radius: 14px; padding: 16px; margin-bottom: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
     .emergency-card { border-left: 4px solid #e53e3e; background: #fff5f5; }
     .late-card { border-left: 4px solid #ed8936; }
@@ -424,22 +432,33 @@ app.get('/doctor', async (req, res) => {
     .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; gap: 6px; flex-wrap: wrap; }
     .queue-num { font-size: 22px; font-weight: 800; color: #2d3748; }
     .badge { font-size: 11px; padding: 3px 8px; border-radius: 20px; font-weight: 600; }
-    .badge.next { background: #c6f6d5; color: #276749; }
-    .badge.wait { background: #feebc8; color: #9c4221; }
-    .badge.late { background: #feebc8; color: #9c4221; margin-left: 4px; }
-    .badge.appt { background: #e9d8fd; color: #553c9a; }
-    .badge.emergency { background: #fed7d7; color: #9b2c2c; }
+    .badge.next{background:#c6f6d5;color:#276749} .badge.wait{background:#feebc8;color:#9c4221}
+    .badge.late{background:#feebc8;color:#9c4221;margin-left:4px} .badge.appt{background:#e9d8fd;color:#553c9a}
+    .badge.emergency{background:#fed7d7;color:#9b2c2c}
     .patient-name { font-size: 18px; font-weight: 700; color: #1a202c; margin-bottom: 6px; }
     .patient-info { font-size: 13px; color: #718096; margin-bottom: 3px; }
-    .done-btn { margin-top: 14px; width: 100%; padding: 14px; background: #38a169; color: white; border: none; border-radius: 10px; font-size: 16px; font-weight: 600; cursor: pointer; }
-    .appt-btn { background: #805ad5; }
-    .emergency-btn { background: #e53e3e; }
+    .btn-row { display: flex; gap: 8px; margin-top: 14px; }
+    .done-btn { flex: 2; padding: 14px; background: #38a169; color: white; border: none; border-radius: 10px; font-size: 15px; font-weight: 600; cursor: pointer; }
+    .skip-btn { flex: 1; padding: 14px; background: #718096; color: white; border: none; border-radius: 10px; font-size: 15px; font-weight: 600; cursor: pointer; }
+    .appt-btn { background: #805ad5; margin-top: 14px; width: 100%; padding: 14px; border: none; border-radius: 10px; font-size: 15px; font-weight: 600; cursor: pointer; color: white; }
+    .emergency-btn { background: #e53e3e; margin-top: 14px; width: 100%; padding: 14px; border: none; border-radius: 10px; font-size: 15px; font-weight: 600; cursor: pointer; color: white; }
     .empty { text-align: center; padding: 30px 20px; color: #a0aec0; font-size: 14px; }
+    .refresh-info { text-align: center; font-size: 11px; color: #a0aec0; margin-top: 20px; padding-bottom: 30px; }
   </style>
 </head>
 <body>
   <h1>🏥 Clinic Panel</h1>
-  <div class="date">📅 ${new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long' })} · Auto-refreshes every 15s</div>
+  <div class="date">📅 ${new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long' })}</div>
+
+  <!-- Staff identity bar -->
+  <div class="staff-bar">
+    <div>
+      <div class="staff-label">Logged in as</div>
+      <div class="staff-name" id="myName">Loading...</div>
+    </div>
+    <span class="staff-change" onclick="changeName()">Change</span>
+    <div class="online-dots" id="onlineDots"></div>
+  </div>
 
   <div class="session-box">
     <div class="session-status">${statusLabel[session.status]}</div>
@@ -458,8 +477,45 @@ app.get('/doctor', async (req, res) => {
   ${queueCards || '<div class="empty">No walk-in patients right now 🎉</div>'}
   <div class="section-title">📅 Appointments</div>
   ${apptCards || '<div class="empty">No appointments scheduled</div>'}
+  <div class="refresh-info">Auto-refreshes every 15s</div>
 
   <script>
+    // ── Staff name management ──
+    function getMyName() {
+      let name = localStorage.getItem('clinicStaffName');
+      if (!name) {
+        name = prompt('Welcome! Enter your name (e.g. Dr. Sharma, Nurse Priya, Reception):') || 'Staff';
+        localStorage.setItem('clinicStaffName', name);
+      }
+      return name;
+    }
+    function changeName() {
+      const name = prompt('Enter your new name:');
+      if (name) { localStorage.setItem('clinicStaffName', name); location.reload(); }
+    }
+
+    const myName = getMyName();
+    document.getElementById('myName').textContent = myName;
+
+    // ── Ping server every 30s to show as online ──
+    async function pingOnline() {
+      await fetch('/staff/ping', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ name: myName }) });
+    }
+    pingOnline();
+    setInterval(pingOnline, 30000);
+
+    // ── Show who's online ──
+    async function loadOnline() {
+      const staff = await fetch('/staff/online').then(r => r.json()).catch(() => []);
+      const dots = document.getElementById('onlineDots');
+      dots.innerHTML = staff.map(s => \`<span class="dot">🟢 \${s.name}</span>\`).join('');
+    }
+    loadOnline();
+
+    // ── Auto-refresh every 15s ──
+    setInterval(() => location.reload(), 15000);
+
+    // ── Actions ──
     async function sessionAction(action) {
       const btn = event.target;
       btn.disabled = true; btn.textContent = 'Please wait...';
@@ -469,13 +525,21 @@ app.get('/doctor', async (req, res) => {
     async function markDone(id) {
       const btn = document.querySelector('#card-' + id + ' .done-btn');
       btn.textContent = 'Processing...'; btn.disabled = true;
-      await fetch('/done', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id }) });
+      await fetch('/done', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id, staffName: myName }) });
       document.getElementById('card-' + id).remove();
+    }
+    async function skipPatient(id) {
+      const card = document.getElementById('card-' + id);
+      const btn = card.querySelector('.skip-btn');
+      btn.textContent = 'Skipping...'; btn.disabled = true;
+      const res = await fetch('/skip', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id, staffName: myName }) });
+      const data = await res.json();
+      if (data.success) { btn.textContent = '✅ #' + data.newQueueNumber; setTimeout(() => location.reload(), 1500); }
     }
     async function apptDone(id) {
       const btn = document.querySelector('#appt-' + id + ' .done-btn');
       btn.textContent = 'Processing...'; btn.disabled = true;
-      await fetch('/appt-done', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id }) });
+      await fetch('/appt-done', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id, staffName: myName }) });
       document.getElementById('appt-' + id).remove();
     }
   </script>
