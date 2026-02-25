@@ -522,6 +522,7 @@ app.get('/doctor', async (req, res) => {
   <div class="session-box">
     <div class="session-status">${statusLabel[session.status]}</div>
     <div class="session-btns">${sessionButtons()}</div>
+<button class="sess-btn" style="background:#3182ce;margin-top:10px;width:100%" onclick="sendReport()">📊 Send Report to Doctor</button>
   </div>
 
   <div class="stats">
@@ -576,6 +577,14 @@ app.get('/doctor', async (req, res) => {
 
     setInterval(() => location.reload(), 15000);
 
+    async function sendReport() {
+  const btn = event.target;
+  btn.disabled = true; btn.textContent = '📤 Sending...';
+  const res = await fetch('/report', { method: 'POST', headers: {'Content-Type':'application/json'} });
+  const data = await res.json();
+  btn.textContent = data.success ? '✅ Report Sent!' : '❌ Failed';
+  setTimeout(() => { btn.textContent = '📊 Send Report to Doctor'; btn.disabled = false; }, 3000);
+}
     async function sessionAction(action) {
       const btn = event.target;
       btn.disabled = true; btn.textContent = 'Please wait...';
