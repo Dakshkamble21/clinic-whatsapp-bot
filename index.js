@@ -19,39 +19,10 @@ const headers = {
   'Content-Type': 'application/json'
 };
 
-async function getWaitingPatient(phone) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(phone)}&status=eq.waiting&select=*`, { headers });
+async function getPatientByStatus(phone, status) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(phone)}&status=eq.${status}&select=*`, { headers });
   const data = await res.json();
   return data.length > 0 ? data[0] : null;
-}
-
-async function getPendingPatient(phone) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(phone)}&status=eq.pending_name&select=*`, { headers });
-  const data = await res.json();
-  return data.length > 0 ? data[0] : null;
-}
-
-async function createPendingPatient(phone) {
-  await fetch(`${SUPABASE_URL}/rest/v1/patients`, {
-    method: 'POST',
-    headers: { ...headers, 'Prefer': 'return=representation' },
-    body: JSON.stringify({ phone, status: 'pending_name' })
-  });
-}
-
-async function confirmPatient(phone, name) {
-  const countRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&select=id`, { headers });
-  const waiting = await countRes.json();
-  const queueNumber = waiting.length + 1;
-  const waitMinutes = waiting.length * MINUTES_PER_PATIENT;
-
-  await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(phone)}&status=eq.pending_name`, {
-    method: 'PATCH',
-    headers,
-    body: JSON.stringify({ name, status: 'waiting', queue_number: queueNumber })
-  });
-
-  return { queueNumber, waitMinutes };
 }
 
 async function sendWhatsApp(to, message) {
@@ -66,39 +37,63 @@ async function sendWhatsApp(to, message) {
   });
 }
 
-// WhatsApp webhook
 app.post('/webhook', async (req, res) => {
   const from = req.body.From;
   const msg = (req.body.Body || '').trim();
   let reply = '';
 
   try {
-    const waiting = await getWaitingPatient(from);
+    // Already in waiting queue
+    const waiting = await getPatientByStatus(from, 'waiting');
     if (waiting) {
-      // Calculate current wait time
       const aheadRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&queue_number=lt.${waiting.queue_number}&select=id`, { headers });
       const ahead = await aheadRes.json();
       const waitMinutes = ahead.length * MINUTES_PER_PATIENT;
+      reply = waitMinutes === 0
+        ? `Hi *${waiting.name}*! 🏥 You are *next in line* (number *${waiting.queue_number}*). Please be ready!`
+        : `Hi *${waiting.name}*! 🏥 You are number *${waiting.queue_number}* in the queue.\n\nEstimated wait: *~${waitMinutes} minutes*. We'll notify you when it's your turn!`;
 
-      if (waitMinutes === 0) {
-        reply = `Hi *${waiting.name}*! 🏥 You are next in line (number *${waiting.queue_number}*). Please be ready!`;
-      } else {
-        reply = `Hi *${waiting.name}*! 🏥 You are number *${waiting.queue_number}* in the queue.\n\nEstimated wait: *~${waitMinutes} minutes*. We will notify you when it's your turn!`;
-      }
+    // Waiting for reason for visit
+    } else if (await getPatientByStatus(from, 'pending_reason')) {
+      const pending = await getPatientByStatus(from, 'pending_reason');
+
+      // Count waiting patients for queue number
+      const countRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&select=id`, { headers });
+      const waitingList = await countRes.json();
+      const queueNumber = waitingList.length + 1;
+      const waitMinutes = waitingList.length * MINUTES_PER_PATIENT;
+
+      // Confirm into queue with reason
+      await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&status=eq.pending_reason`, {
+        method: 'PATCH',
+        headers,
+        body: JSON.stringify({ reason: msg, status: 'waiting', queue_number: queueNumber })
+      });
+
+      reply = waitMinutes === 0
+        ? `Thank you, *${pending.name}*! 🏥 You are number *${queueNumber}* in the queue — you're next! Please be ready.`
+        : `Thank you, *${pending.name}*! 🏥 You are number *${queueNumber}* in the queue.\n\nEstimated wait: *~${waitMinutes} minutes*. We'll notify you when it's your turn!`;
+
+    // Waiting for name
+    } else if (await getPatientByStatus(from, 'pending_name')) {
+      // Save name, now ask for reason
+      await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&status=eq.pending_name`, {
+        method: 'PATCH',
+        headers,
+        body: JSON.stringify({ name: msg, status: 'pending_reason' })
+      });
+      reply = `Thank you, *${msg}*! 😊\n\nPlease reply with your *reason for visit* (e.g. fever, checkup, follow-up):`;
+
+    // Brand new patient
     } else {
-      const pending = await getPendingPatient(from);
-      if (pending) {
-        const { queueNumber, waitMinutes } = await confirmPatient(from, msg);
-        if (waitMinutes === 0) {
-          reply = `Thank you, *${msg}*! 🏥 You are number *${queueNumber}* in the queue. You are next — please be ready!`;
-        } else {
-          reply = `Thank you, *${msg}*! 🏥 You are number *${queueNumber}* in the queue.\n\nEstimated wait: *~${waitMinutes} minutes*. We will notify you when it's your turn!`;
-        }
-      } else {
-        await createPendingPatient(from);
-        reply = `Welcome to our clinic! 👋 Please reply with your *full name* to join the queue.`;
-      }
+      await fetch(`${SUPABASE_URL}/rest/v1/patients`, {
+        method: 'POST',
+        headers: { ...headers, 'Prefer': 'return=representation' },
+        body: JSON.stringify({ phone: from, status: 'pending_name' })
+      });
+      reply = `Welcome to our clinic! 👋 Please reply with your *full name* to join the queue.`;
     }
+
   } catch (err) {
     console.error('Error:', err);
     reply = 'Sorry, something went wrong. Please try again.';
@@ -112,7 +107,7 @@ app.post('/webhook', async (req, res) => {
   res.send(response);
 });
 
-// Mark patient as done and notify next patient
+// Mark done and notify next
 app.post('/done', async (req, res) => {
   const { id } = req.body;
 
@@ -145,6 +140,7 @@ app.get('/doctor', async (req, res) => {
       <td>${p.queue_number}</td>
       <td>${p.name || 'Unknown'}</td>
       <td>${p.phone.replace('whatsapp:', '')}</td>
+      <td>${p.reason || '—'}</td>
       <td>${new Date(p.created_at).toLocaleTimeString()}</td>
       <td>${waitMins === 0 ? '🟢 Next' : `~${waitMins} mins`}</td>
       <td><button onclick="markDone(${p.id})">✅ Done</button></td>
@@ -173,15 +169,15 @@ app.get('/doctor', async (req, res) => {
   <div class="count">Patients waiting: <strong>${patients.length}</strong> &nbsp;|&nbsp; Auto-refreshes every 15 seconds</div>
   <table>
     <thead>
-      <tr><th>#</th><th>Name</th><th>Phone</th><th>Arrived</th><th>Est. Wait</th><th>Action</th></tr>
+      <tr><th>#</th><th>Name</th><th>Phone</th><th>Reason</th><th>Arrived</th><th>Est. Wait</th><th>Action</th></tr>
     </thead>
     <tbody>
-      ${rows || '<tr><td colspan="6" style="text-align:center;padding:40px;color:#999">No patients waiting 🎉</td></tr>'}
+      ${rows || '<tr><td colspan="7" style="text-align:center;padding:40px;color:#999">No patients waiting 🎉</td></tr>'}
     </tbody>
   </table>
   <script>
     async function markDone(id) {
-      await fetch('/done', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ id }) });
+      await fetch('/done', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id }) });
       document.getElementById('row-' + id).remove();
     }
   </script>
