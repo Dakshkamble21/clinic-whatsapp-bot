@@ -12,44 +12,16 @@ const headers = {
   'Content-Type': 'application/json'
 };
 
-async function getPatient(phone) {
+async function getWaitingPatient(phone) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(phone)}&status=eq.waiting&select=*`, { headers });
   const data = await res.json();
   return data.length > 0 ? data[0] : null;
 }
 
-async function addPatient(phone, name) {
-  const countRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&select=id`, { headers });
-  const waiting = await countRes.json();
-  const queueNumber = waiting.length + 1;
-
-  await fetch(`${SUPABASE_URL}/rest/v1/patients`, {
-    method: 'POST',
-    headers: { ...headers, 'Prefer': 'return=representation' },
-    body: JSON.stringify({ phone, name, queue_number: queueNumber, status: 'waiting' })
-  });
-
-  return queueNumber;
-}
-
-async function updateName(phone, name) {
-  await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(phone)}&status=eq.pending_name`, {
-    method: 'PATCH',
-    headers,
-    body: JSON.stringify({ name, status: 'waiting' })
-  });
-
-  const countRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&select=id`, { headers });
-  const waiting = await countRes.json();
-  const queueNumber = waiting.length;
-
-  await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(phone)}&status=eq.waiting`, {
-    method: 'PATCH',
-    headers,
-    body: JSON.stringify({ queue_number: queueNumber })
-  });
-
-  return queueNumber;
+async function getPendingPatient(phone) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(phone)}&status=eq.pending_name&select=*`, { headers });
+  const data = await res.json();
+  return data.length > 0 ? data[0] : null;
 }
 
 async function createPendingPatient(phone) {
@@ -60,10 +32,20 @@ async function createPendingPatient(phone) {
   });
 }
 
-async function getPendingPatient(phone) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(phone)}&status=eq.pending_name&select=*`, { headers });
-  const data = await res.json();
-  return data.length > 0 ? data[0] : null;
+async function confirmPatient(phone, name) {
+  // Count current waiting patients
+  const countRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&select=id`, { headers });
+  const waiting = await countRes.json();
+  const queueNumber = waiting.length + 1;
+
+  // Update pending record to waiting with name and queue number
+  await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(phone)}&status=eq.pending_name`, {
+    method: 'PATCH',
+    headers,
+    body: JSON.stringify({ name, status: 'waiting', queue_number: queueNumber })
+  });
+
+  return queueNumber;
 }
 
 app.post('/webhook', async (req, res) => {
@@ -73,19 +55,18 @@ app.post('/webhook', async (req, res) => {
   let reply = '';
 
   try {
-    // Check if already in queue
-    const existing = await getPatient(from);
-    if (existing) {
-      reply = `You are already in the queue as *${existing.name}*, number *${existing.queue_number}*. Please wait, we will call you shortly. 🏥`;
+    // 1. Already in waiting queue?
+    const waiting = await getWaitingPatient(from);
+    if (waiting) {
+      reply = `Hi *${waiting.name}*! You are already in the queue as number *${waiting.queue_number}*. Please wait, we will call you shortly. 🏥`;
     } else {
-      // Check if waiting for name
+      // 2. Waiting for name?
       const pending = await getPendingPatient(from);
       if (pending) {
-        // They just sent their name
-        const queueNumber = await updateName(from, msg);
+        const queueNumber = await confirmPatient(from, msg);
         reply = `Thank you, *${msg}*! 🏥 You are number *${queueNumber}* in the queue. Please wait, we will call you shortly.`;
       } else {
-        // New patient — ask for name
+        // 3. Brand new patient
         await createPendingPatient(from);
         reply = `Welcome to our clinic! 👋 Please reply with your *full name* to join the queue.`;
       }
