@@ -24,6 +24,12 @@ async function getPatientByStatus(phone, status) {
   return data.length > 0 ? data[0] : null;
 }
 
+async function getApptPending(phone) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/appointments?phone=eq.${encodeURIComponent(phone)}&status=eq.pending_time&select=*`, { headers });
+  const data = await res.json();
+  return data.length > 0 ? data[0] : null;
+}
+
 async function sendWhatsApp(to, message) {
   const credentials = Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString('base64');
   await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`, {
@@ -39,9 +45,11 @@ async function sendWhatsApp(to, message) {
 app.post('/webhook', async (req, res) => {
   const from = req.body.From;
   const msg = (req.body.Body || '').trim();
+  const msgLower = msg.toLowerCase();
   let reply = '';
 
   try {
+    // Already in waiting queue
     const waiting = await getPatientByStatus(from, 'waiting');
     if (waiting) {
       const aheadRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&queue_number=lt.${waiting.queue_number}&select=id`, { headers });
@@ -51,23 +59,65 @@ app.post('/webhook', async (req, res) => {
         ? `Hi *${waiting.name}*! 🏥 You are *next in line* (number *${waiting.queue_number}*). Please be ready!`
         : `Hi *${waiting.name}*! 🏥 You are number *${waiting.queue_number}* in the queue.\n\nEstimated wait: *~${waitMinutes} minutes*. We'll notify you when it's your turn!`;
 
+    // Waiting for appointment time
+    } else if (await getApptPending(from)) {
+      const appt = await getApptPending(from);
+      await fetch(`${SUPABASE_URL}/rest/v1/appointments?phone=eq.${encodeURIComponent(from)}&status=eq.pending_time`, {
+        method: 'PATCH',
+        headers,
+        body: JSON.stringify({ appt_time: msg, status: 'confirmed' })
+      });
+      reply = `✅ Appointment confirmed!\n\n*Name:* ${appt.name}\n*Reason:* ${appt.reason}\n*Time:* ${msg}\n\nWe'll see you then! 🏥 Reply *status* anytime to check your appointment.`;
+
+    // Choosing between queue or appointment
+    } else if (await getPatientByStatus(from, 'pending_choice')) {
+      const pending = await getPatientByStatus(from, 'pending_choice');
+      if (msgLower === '1' || msgLower.includes('walk') || msgLower.includes('queue')) {
+        // Join walk-in queue
+        const countRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&select=id`, { headers });
+        const waitingList = await countRes.json();
+        const queueNumber = waitingList.length + 1;
+        const waitMinutes = waitingList.length * MINUTES_PER_PATIENT;
+
+        await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&status=eq.pending_choice`, {
+          method: 'PATCH',
+          headers,
+          body: JSON.stringify({ status: 'waiting', queue_number: queueNumber })
+        });
+
+        reply = waitMinutes === 0
+          ? `✅ You're in the queue, *${pending.name}*! You are *number ${queueNumber}* — you're next! Please be ready. 🏥`
+          : `✅ You're in the queue, *${pending.name}*! You are *number ${queueNumber}*.\n\nEstimated wait: *~${waitMinutes} minutes*. We'll notify you when it's your turn! 🏥`;
+
+      } else if (msgLower === '2' || msgLower.includes('appoint') || msgLower.includes('book')) {
+        // Book appointment
+        await fetch(`${SUPABASE_URL}/rest/v1/appointments`, {
+          method: 'POST',
+          headers: { ...headers, 'Prefer': 'return=representation' },
+          body: JSON.stringify({ phone: from, name: pending.name, reason: pending.reason, status: 'pending_time' })
+        });
+        // Remove from patients table
+        await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&status=eq.pending_choice`, {
+          method: 'DELETE',
+          headers
+        });
+        reply = `📅 Let's book your appointment!\n\nPlease reply with your preferred *date and time*.\nExample: _Tomorrow 10am_ or _Monday 3pm_`;
+
+      } else {
+        reply = `Please reply with:\n*1* — Join walk-in queue now\n*2* — Book an appointment`;
+      }
+
+    // Waiting for reason
     } else if (await getPatientByStatus(from, 'pending_reason')) {
       const pending = await getPatientByStatus(from, 'pending_reason');
-      const countRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&select=id`, { headers });
-      const waitingList = await countRes.json();
-      const queueNumber = waitingList.length + 1;
-      const waitMinutes = waitingList.length * MINUTES_PER_PATIENT;
-
       await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&status=eq.pending_reason`, {
         method: 'PATCH',
         headers,
-        body: JSON.stringify({ reason: msg, status: 'waiting', queue_number: queueNumber })
+        body: JSON.stringify({ reason: msg, status: 'pending_choice' })
       });
+      reply = `Got it! *Reason:* ${msg}\n\nHow would you like to see the doctor?\n\n*1* — 🚶 Join walk-in queue now\n*2* — 📅 Book an appointment`;
 
-      reply = waitMinutes === 0
-        ? `Thank you, *${pending.name}*! 🏥 You are number *${queueNumber}* — you're next! Please be ready.`
-        : `Thank you, *${pending.name}*! 🏥 You are number *${queueNumber}* in the queue.\n\nEstimated wait: *~${waitMinutes} minutes*. We'll notify you when it's your turn!`;
-
+    // Waiting for name
     } else if (await getPatientByStatus(from, 'pending_name')) {
       await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&status=eq.pending_name`, {
         method: 'PATCH',
@@ -76,13 +126,25 @@ app.post('/webhook', async (req, res) => {
       });
       reply = `Thank you, *${msg}*! 😊\n\nPlease reply with your *reason for visit* (e.g. fever, checkup, follow-up):`;
 
+    // Check appointment status
+    } else if (msgLower === 'status') {
+      const apptRes = await fetch(`${SUPABASE_URL}/rest/v1/appointments?phone=eq.${encodeURIComponent(from)}&status=eq.confirmed&order=created_at.desc&limit=1&select=*`, { headers });
+      const appts = await apptRes.json();
+      if (appts.length > 0) {
+        const a = appts[0];
+        reply = `📅 *Your Appointment*\n\n*Name:* ${a.name}\n*Reason:* ${a.reason}\n*Time:* ${a.appt_time}\n*Status:* Confirmed ✅`;
+      } else {
+        reply = `You have no upcoming appointments. Send any message to join the queue or book one!`;
+      }
+
+    // Brand new patient
     } else {
       await fetch(`${SUPABASE_URL}/rest/v1/patients`, {
         method: 'POST',
         headers: { ...headers, 'Prefer': 'return=representation' },
         body: JSON.stringify({ phone: from, status: 'pending_name' })
       });
-      reply = `Welcome to our clinic! 👋 Please reply with your *full name* to join the queue.`;
+      reply = `Welcome to our clinic! 👋 Please reply with your *full name* to get started.`;
     }
 
   } catch (err) {
@@ -117,28 +179,37 @@ app.post('/done', async (req, res) => {
   res.json({ success: true });
 });
 
+app.post('/appt-done', async (req, res) => {
+  const { id } = req.body;
+  await fetch(`${SUPABASE_URL}/rest/v1/appointments?id=eq.${id}`, {
+    method: 'PATCH',
+    headers,
+    body: JSON.stringify({ status: 'done' })
+  });
+  res.json({ success: true });
+});
+
 app.get('/doctor', async (req, res) => {
   const today = new Date().toISOString().split('T')[0];
 
-  const [waitingRes, doneRes, allTodayRes] = await Promise.all([
+  const [waitingRes, doneRes, allTodayRes, apptsRes] = await Promise.all([
     fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&order=queue_number.asc&select=*`, { headers }),
     fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.done&created_at=gte.${today}T00:00:00&select=id`, { headers }),
-    fetch(`${SUPABASE_URL}/rest/v1/patients?created_at=gte.${today}T00:00:00&select=id`, { headers })
+    fetch(`${SUPABASE_URL}/rest/v1/patients?created_at=gte.${today}T00:00:00&select=id`, { headers }),
+    fetch(`${SUPABASE_URL}/rest/v1/appointments?status=eq.confirmed&order=created_at.asc&select=*`, { headers })
   ]);
 
   const patients = await waitingRes.json();
   const doneToday = await doneRes.json();
   const allToday = await allTodayRes.json();
+  const appointments = await apptsRes.json();
 
-  const cards = patients.map((p, i) => {
+  const queueCards = patients.map((p, i) => {
     const waitMins = i * MINUTES_PER_PATIENT;
-    const waitLabel = waitMins === 0 ? '<span class="badge next">🟢 Next</span>' : `<span class="badge wait">~${waitMins} mins</span>`;
+    const badge = waitMins === 0 ? '<span class="badge next">🟢 Next</span>' : `<span class="badge wait">~${waitMins} mins</span>`;
     return `
     <div class="patient-card" id="card-${p.id}">
-      <div class="card-header">
-        <span class="queue-num">#${p.queue_number}</span>
-        ${waitLabel}
-      </div>
+      <div class="card-header"><span class="queue-num">#${p.queue_number}</span>${badge}</div>
       <div class="patient-name">${p.name || 'Unknown'}</div>
       <div class="patient-info">📞 ${p.phone.replace('whatsapp:', '')}</div>
       <div class="patient-info">🩺 ${p.reason || '—'}</div>
@@ -146,6 +217,16 @@ app.get('/doctor', async (req, res) => {
       <button class="done-btn" onclick="markDone(${p.id})">✅ Done — Call Next</button>
     </div>`;
   }).join('');
+
+  const apptCards = appointments.map(a => `
+    <div class="patient-card appt-card" id="appt-${a.id}">
+      <div class="card-header"><span class="queue-num">📅</span><span class="badge appt">Appointment</span></div>
+      <div class="patient-name">${a.name || 'Unknown'}</div>
+      <div class="patient-info">📞 ${a.phone.replace('whatsapp:', '')}</div>
+      <div class="patient-info">🩺 ${a.reason || '—'}</div>
+      <div class="patient-info">🕐 Time: <strong>${a.appt_time}</strong></div>
+      <button class="done-btn appt-btn" onclick="apptDone(${a.id})">✅ Appointment Done</button>
+    </div>`).join('');
 
   res.send(`<!DOCTYPE html>
 <html>
@@ -162,22 +243,21 @@ app.get('/doctor', async (req, res) => {
     .stat { background: white; border-radius: 12px; padding: 14px; text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
     .stat .num { font-size: 28px; font-weight: 700; }
     .stat .lbl { font-size: 11px; color: #718096; margin-top: 2px; }
-    .blue { color: #3182ce; }
-    .orange { color: #dd6b20; }
-    .green { color: #38a169; }
-    .gray { color: #4a5568; }
+    .blue { color: #3182ce; } .orange { color: #dd6b20; } .green { color: #38a169; } .gray { color: #4a5568; }
+    .section-title { font-size: 13px; font-weight: 600; color: #718096; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; margin-top: 20px; }
     .patient-card { background: white; border-radius: 14px; padding: 16px; margin-bottom: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    .appt-card { border-left: 4px solid #805ad5; }
     .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
     .queue-num { font-size: 22px; font-weight: 800; color: #2d3748; }
     .badge { font-size: 12px; padding: 4px 10px; border-radius: 20px; font-weight: 600; }
     .badge.next { background: #c6f6d5; color: #276749; }
     .badge.wait { background: #feebc8; color: #9c4221; }
+    .badge.appt { background: #e9d8fd; color: #553c9a; }
     .patient-name { font-size: 18px; font-weight: 700; color: #1a202c; margin-bottom: 6px; }
     .patient-info { font-size: 13px; color: #718096; margin-bottom: 3px; }
     .done-btn { margin-top: 14px; width: 100%; padding: 14px; background: #38a169; color: white; border: none; border-radius: 10px; font-size: 16px; font-weight: 600; cursor: pointer; }
-    .done-btn:active { background: #2f855a; }
-    .empty { text-align: center; padding: 60px 20px; color: #a0aec0; font-size: 16px; }
-    .section-title { font-size: 13px; font-weight: 600; color: #718096; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
+    .appt-btn { background: #805ad5; }
+    .empty { text-align: center; padding: 40px 20px; color: #a0aec0; font-size: 15px; }
   </style>
 </head>
 <body>
@@ -188,19 +268,27 @@ app.get('/doctor', async (req, res) => {
     <div class="stat"><div class="num blue">${allToday.length}</div><div class="lbl">Total Today</div></div>
     <div class="stat"><div class="num orange">${patients.length}</div><div class="lbl">Waiting Now</div></div>
     <div class="stat"><div class="num green">${doneToday.length}</div><div class="lbl">Seen Today</div></div>
-    <div class="stat"><div class="num gray">${patients.length * MINUTES_PER_PATIENT}</div><div class="lbl">Max Wait (mins)</div></div>
+    <div class="stat"><div class="num gray">${appointments.length}</div><div class="lbl">Appointments</div></div>
   </div>
 
-  <div class="section-title">Patients in Queue</div>
-  ${cards || '<div class="empty">🎉 No patients waiting right now!</div>'}
+  <div class="section-title">🚶 Walk-in Queue</div>
+  ${queueCards || '<div class="empty">No walk-in patients right now 🎉</div>'}
+
+  <div class="section-title">📅 Appointments</div>
+  ${apptCards || '<div class="empty">No appointments scheduled</div>'}
 
   <script>
     async function markDone(id) {
       const btn = document.querySelector('#card-' + id + ' .done-btn');
-      btn.textContent = 'Processing...';
-      btn.disabled = true;
+      btn.textContent = 'Processing...'; btn.disabled = true;
       await fetch('/done', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id }) });
       document.getElementById('card-' + id).remove();
+    }
+    async function apptDone(id) {
+      const btn = document.querySelector('#appt-' + id + ' .done-btn');
+      btn.textContent = 'Processing...'; btn.disabled = true;
+      await fetch('/appt-done', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id }) });
+      document.getElementById('appt-' + id).remove();
     }
   </script>
 </body>
