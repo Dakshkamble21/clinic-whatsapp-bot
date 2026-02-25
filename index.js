@@ -18,16 +18,39 @@ const headers = {
   'Content-Type': 'application/json'
 };
 
+const MAIN_MENU = `🏥 *Welcome to our Clinic!*
+
+Please choose an option:
+*1* — 🩺 Join the queue
+*2* — 📋 Check my status
+*3* — ❌ Cancel my token
+*4* — ⏰ I'm running late
+*5* — 🚨 Emergency
+
+Reply with a number (1-5)`;
+
 async function getPatientByStatus(phone, status) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(phone)}&status=eq.${status}&select=*`, { headers });
   const data = await res.json();
   return data.length > 0 ? data[0] : null;
 }
 
-async function getApptPending(phone) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/appointments?phone=eq.${encodeURIComponent(phone)}&status=eq.pending_time&select=*`, { headers });
-  const data = await res.json();
-  return data.length > 0 ? data[0] : null;
+async function getActivePatient(phone) {
+  const statuses = ['waiting', 'running_late', 'emergency'];
+  for (const status of statuses) {
+    const p = await getPatientByStatus(phone, status);
+    if (p) return p;
+  }
+  return null;
+}
+
+async function getPendingPatient(phone) {
+  const statuses = ['pending_name', 'pending_reason', 'pending_choice'];
+  for (const status of statuses) {
+    const p = await getPatientByStatus(phone, status);
+    if (p) return p;
+  }
+  return null;
 }
 
 async function sendWhatsApp(to, message) {
@@ -42,6 +65,12 @@ async function sendWhatsApp(to, message) {
   });
 }
 
+async function getWaitInfo(queueNumber) {
+  const aheadRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=in.(waiting,running_late,emergency)&queue_number=lt.${queueNumber}&select=id`, { headers });
+  const ahead = await aheadRes.json();
+  return ahead.length;
+}
+
 app.post('/webhook', async (req, res) => {
   const from = req.body.From;
   const msg = (req.body.Body || '').trim();
@@ -49,107 +78,158 @@ app.post('/webhook', async (req, res) => {
   let reply = '';
 
   try {
-    // Already in waiting queue
-    const waiting = await getPatientByStatus(from, 'waiting');
-    if (waiting) {
-      const aheadRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&queue_number=lt.${waiting.queue_number}&select=id`, { headers });
-      const ahead = await aheadRes.json();
-      const waitMinutes = ahead.length * MINUTES_PER_PATIENT;
-      reply = waitMinutes === 0
-        ? `Hi *${waiting.name}*! 🏥 You are *next in line* (number *${waiting.queue_number}*). Please be ready!`
-        : `Hi *${waiting.name}*! 🏥 You are number *${waiting.queue_number}* in the queue.\n\nEstimated wait: *~${waitMinutes} minutes*. We'll notify you when it's your turn!`;
-
-    // Waiting for appointment time
-    } else if (await getApptPending(from)) {
-      const appt = await getApptPending(from);
-      await fetch(`${SUPABASE_URL}/rest/v1/appointments?phone=eq.${encodeURIComponent(from)}&status=eq.pending_time`, {
-        method: 'PATCH',
-        headers,
-        body: JSON.stringify({ appt_time: msg, status: 'confirmed' })
+    // --- Check if mid-registration flow ---
+    const pendingName = await getPatientByStatus(from, 'pending_name');
+    if (pendingName) {
+      await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&status=eq.pending_name`, {
+        method: 'PATCH', headers,
+        body: JSON.stringify({ name: msg, status: 'pending_reason' })
       });
-      reply = `✅ Appointment confirmed!\n\n*Name:* ${appt.name}\n*Reason:* ${appt.reason}\n*Time:* ${msg}\n\nWe'll see you then! 🏥 Reply *status* anytime to check your appointment.`;
+      reply = `Thank you, *${msg}*! 😊\n\nPlease reply with your *reason for visit*\n(e.g. fever, checkup, follow-up):`;
 
-    // Choosing between queue or appointment
+    } else if (await getPatientByStatus(from, 'pending_reason')) {
+      const pending = await getPatientByStatus(from, 'pending_reason');
+      await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&status=eq.pending_reason`, {
+        method: 'PATCH', headers,
+        body: JSON.stringify({ reason: msg, status: 'pending_choice' })
+      });
+      reply = `Got it! 🩺 *Reason:* ${msg}\n\nHow would you like to see the doctor?\n\n*1* — 🚶 Join walk-in queue now\n*2* — 📅 Book an appointment`;
+
     } else if (await getPatientByStatus(from, 'pending_choice')) {
       const pending = await getPatientByStatus(from, 'pending_choice');
-      if (msgLower === '1' || msgLower.includes('walk') || msgLower.includes('queue')) {
-        // Join walk-in queue
-        const countRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&select=id`, { headers });
+      if (msg === '1' || msgLower.includes('walk') || msgLower.includes('queue')) {
+        const countRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=in.(waiting,running_late,emergency)&select=id`, { headers });
         const waitingList = await countRes.json();
         const queueNumber = waitingList.length + 1;
         const waitMinutes = waitingList.length * MINUTES_PER_PATIENT;
 
         await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&status=eq.pending_choice`, {
-          method: 'PATCH',
-          headers,
+          method: 'PATCH', headers,
           body: JSON.stringify({ status: 'waiting', queue_number: queueNumber })
         });
 
         reply = waitMinutes === 0
-          ? `✅ You're in the queue, *${pending.name}*! You are *number ${queueNumber}* — you're next! Please be ready. 🏥`
-          : `✅ You're in the queue, *${pending.name}*! You are *number ${queueNumber}*.\n\nEstimated wait: *~${waitMinutes} minutes*. We'll notify you when it's your turn! 🏥`;
+          ? `✅ You're in! *${pending.name}*, you are *#${queueNumber}* — you're next! Please be ready. 🏥`
+          : `✅ You're in! *${pending.name}*, you are *#${queueNumber}* in the queue.\n\nEstimated wait: *~${waitMinutes} minutes*\n\nWe'll notify you when it's your turn! 🏥\n\nReply *menu* anytime to see options.`;
 
-      } else if (msgLower === '2' || msgLower.includes('appoint') || msgLower.includes('book')) {
-        // Book appointment
+      } else if (msg === '2' || msgLower.includes('appoint') || msgLower.includes('book')) {
         await fetch(`${SUPABASE_URL}/rest/v1/appointments`, {
           method: 'POST',
           headers: { ...headers, 'Prefer': 'return=representation' },
           body: JSON.stringify({ phone: from, name: pending.name, reason: pending.reason, status: 'pending_time' })
         });
-        // Remove from patients table
         await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&status=eq.pending_choice`, {
-          method: 'DELETE',
-          headers
+          method: 'DELETE', headers
         });
         reply = `📅 Let's book your appointment!\n\nPlease reply with your preferred *date and time*.\nExample: _Tomorrow 10am_ or _Monday 3pm_`;
-
       } else {
-        reply = `Please reply with:\n*1* — Join walk-in queue now\n*2* — Book an appointment`;
+        reply = `Please reply with:\n*1* — 🚶 Walk-in queue\n*2* — 📅 Book appointment`;
       }
 
-    // Waiting for reason
-    } else if (await getPatientByStatus(from, 'pending_reason')) {
-      const pending = await getPatientByStatus(from, 'pending_reason');
-      await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&status=eq.pending_reason`, {
-        method: 'PATCH',
-        headers,
-        body: JSON.stringify({ reason: msg, status: 'pending_choice' })
-      });
-      reply = `Got it! *Reason:* ${msg}\n\nHow would you like to see the doctor?\n\n*1* — 🚶 Join walk-in queue now\n*2* — 📅 Book an appointment`;
-
-    // Waiting for name
-    } else if (await getPatientByStatus(from, 'pending_name')) {
-      await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&status=eq.pending_name`, {
-        method: 'PATCH',
-        headers,
-        body: JSON.stringify({ name: msg, status: 'pending_reason' })
-      });
-      reply = `Thank you, *${msg}*! 😊\n\nPlease reply with your *reason for visit* (e.g. fever, checkup, follow-up):`;
-
-    // Check appointment status
-    } else if (msgLower === 'status') {
-      const apptRes = await fetch(`${SUPABASE_URL}/rest/v1/appointments?phone=eq.${encodeURIComponent(from)}&status=eq.confirmed&order=created_at.desc&limit=1&select=*`, { headers });
+    } else if (await getPatientByStatus(from, 'pending_time') || 
+               (await fetch(`${SUPABASE_URL}/rest/v1/appointments?phone=eq.${encodeURIComponent(from)}&status=eq.pending_time&select=*`, { headers }).then(r => r.json()).then(d => d.length > 0))) {
+      const apptRes = await fetch(`${SUPABASE_URL}/rest/v1/appointments?phone=eq.${encodeURIComponent(from)}&status=eq.pending_time&select=*`, { headers });
       const appts = await apptRes.json();
       if (appts.length > 0) {
-        const a = appts[0];
-        reply = `📅 *Your Appointment*\n\n*Name:* ${a.name}\n*Reason:* ${a.reason}\n*Time:* ${a.appt_time}\n*Status:* Confirmed ✅`;
-      } else {
-        reply = `You have no upcoming appointments. Send any message to join the queue or book one!`;
+        const appt = appts[0];
+        await fetch(`${SUPABASE_URL}/rest/v1/appointments?phone=eq.${encodeURIComponent(from)}&status=eq.pending_time`, {
+          method: 'PATCH', headers,
+          body: JSON.stringify({ appt_time: msg, status: 'confirmed' })
+        });
+        reply = `✅ *Appointment Confirmed!*\n\n👤 *Name:* ${appt.name}\n🩺 *Reason:* ${appt.reason}\n🕐 *Time:* ${msg}\n\nWe'll see you then! 🏥\nReply *menu* anytime for options.`;
       }
 
-    // Brand new patient
     } else {
-      await fetch(`${SUPABASE_URL}/rest/v1/patients`, {
-        method: 'POST',
-        headers: { ...headers, 'Prefer': 'return=representation' },
-        body: JSON.stringify({ phone: from, status: 'pending_name' })
-      });
-      reply = `Welcome to our clinic! 👋 Please reply with your *full name* to get started.`;
+      // --- MAIN MENU HANDLING ---
+      const active = await getActivePatient(from);
+
+      if (msg === '1' || msgLower === 'join') {
+        if (active) {
+          const ahead = await getWaitInfo(active.queue_number);
+          const waitMins = ahead * MINUTES_PER_PATIENT;
+          reply = `You are already in the queue as *${active.name}*!\n\n📋 *Queue #:* ${active.queue_number}\n⏳ *Est. wait:* ~${waitMins} minutes\n🩺 *Status:* ${active.status}\n\nReply *menu* to see all options.`;
+        } else {
+          await fetch(`${SUPABASE_URL}/rest/v1/patients`, {
+            method: 'POST',
+            headers: { ...headers, 'Prefer': 'return=representation' },
+            body: JSON.stringify({ phone: from, status: 'pending_name' })
+          });
+          reply = `Let's get you registered! 📝\n\nPlease reply with your *full name*:`;
+        }
+
+      } else if (msg === '2' || msgLower === 'status') {
+        if (active) {
+          const ahead = await getWaitInfo(active.queue_number);
+          const waitMins = ahead * MINUTES_PER_PATIENT;
+          const statusEmoji = active.status === 'emergency' ? '🚨' : active.status === 'running_late' ? '⏰' : '🟢';
+          reply = waitMins === 0
+            ? `${statusEmoji} *${active.name}*, you are *NEXT* in line!\n\nPlease make your way to the clinic now. 🏥`
+            : `${statusEmoji} *Queue Status for ${active.name}*\n\n🔢 *Your number:* #${active.queue_number}\n👥 *People ahead:* ${ahead}\n⏳ *Est. wait:* ~${waitMins} minutes\n🩺 *Reason:* ${active.reason || '—'}\n\nWe'll notify you when it's your turn!`;
+        } else {
+          reply = `You are not currently in the queue.\n\n${MAIN_MENU}`;
+        }
+
+      } else if (msg === '3' || msgLower === 'cancel') {
+        if (active) {
+          await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&id=eq.${active.id}`, {
+            method: 'PATCH', headers,
+            body: JSON.stringify({ status: 'cancelled' })
+          });
+          reply = `✅ Your token *#${active.queue_number}* has been cancelled, *${active.name}*.\n\nWe hope to see you soon! 🏥\nReply *1* anytime to rejoin the queue.`;
+        } else {
+          reply = `You don't have an active token to cancel.\n\n${MAIN_MENU}`;
+        }
+
+      } else if (msg === '4' || msgLower.includes('late')) {
+        if (active) {
+          await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&id=eq.${active.id}`, {
+            method: 'PATCH', headers,
+            body: JSON.stringify({ status: 'running_late' })
+          });
+          // Notify doctor
+          await fetch(`${SUPABASE_URL}/rest/v1/late_alerts`, {
+            method: 'POST',
+            headers: { ...headers, 'Prefer': 'return=representation' },
+            body: JSON.stringify({ patient_name: active.name, queue_number: active.queue_number, phone: from })
+          }).catch(() => {}); // ignore if table doesn't exist yet
+          reply = `⏰ Got it, *${active.name}*! We've noted that you're running late.\n\nYour token *#${active.queue_number}* is still saved. The doctor has been notified.\n\nPlease come as soon as you can! 🏥`;
+        } else {
+          reply = `You don't have an active token.\n\n${MAIN_MENU}`;
+        }
+
+      } else if (msg === '5' || msgLower.includes('emergency')) {
+        if (active) {
+          await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&id=eq.${active.id}`, {
+            method: 'PATCH', headers,
+            body: JSON.stringify({ status: 'emergency' })
+          });
+          reply = `🚨 *Emergency request sent for ${active.name}!*\n\nThe doctor has been notified. Please come to the clinic immediately.\n\nIf this is a medical emergency, call *112* right away.`;
+        } else {
+          // New emergency patient — fast track
+          await fetch(`${SUPABASE_URL}/rest/v1/patients`, {
+            method: 'POST',
+            headers: { ...headers, 'Prefer': 'return=representation' },
+            body: JSON.stringify({ phone: from, status: 'emergency', queue_number: 0, name: 'Emergency Patient' })
+          });
+          reply = `🚨 *Emergency registered!*\n\nPlease come to the clinic immediately. The doctor has been alerted.\n\nIf this is a life-threatening emergency, call *112* right away.`;
+        }
+
+      } else if (msgLower === 'menu' || msgLower === 'hi' || msgLower === 'hello' || msgLower === 'start' || msg === '0') {
+        reply = MAIN_MENU;
+
+      } else {
+        // Unrecognised input
+        if (active) {
+          reply = `I didn't understand that. 😊\n\n${MAIN_MENU}`;
+        } else {
+          reply = MAIN_MENU;
+        }
+      }
     }
 
   } catch (err) {
     console.error('Error:', err);
-    reply = 'Sorry, something went wrong. Please try again.';
+    reply = 'Sorry, something went wrong. Please try again or reply *menu*.';
   }
 
   const response = `<?xml version="1.0" encoding="UTF-8"?>
@@ -163,53 +243,62 @@ app.post('/webhook', async (req, res) => {
 app.post('/done', async (req, res) => {
   const { id } = req.body;
   await fetch(`${SUPABASE_URL}/rest/v1/patients?id=eq.${id}`, {
-    method: 'PATCH',
-    headers,
+    method: 'PATCH', headers,
     body: JSON.stringify({ status: 'done' })
   });
-
-  const nextRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&order=queue_number.asc&limit=1&select=*`, { headers });
+  const nextRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=in.(waiting,running_late)&order=queue_number.asc&limit=1&select=*`, { headers });
   const nextPatients = await nextRes.json();
-
   if (nextPatients.length > 0) {
     const next = nextPatients[0];
     await sendWhatsApp(next.phone, `🔔 *${next.name}*, it's your turn! Please come in now. The doctor is ready for you. 🏥`);
   }
-
   res.json({ success: true });
 });
 
 app.post('/appt-done', async (req, res) => {
   const { id } = req.body;
   await fetch(`${SUPABASE_URL}/rest/v1/appointments?id=eq.${id}`, {
-    method: 'PATCH',
-    headers,
-    body: JSON.stringify({ status: 'done' })
+    method: 'PATCH', headers, body: JSON.stringify({ status: 'done' })
   });
   res.json({ success: true });
 });
 
 app.get('/doctor', async (req, res) => {
   const today = new Date().toISOString().split('T')[0];
-
-  const [waitingRes, doneRes, allTodayRes, apptsRes] = await Promise.all([
-    fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&order=queue_number.asc&select=*`, { headers }),
+  const [waitingRes, doneRes, allTodayRes, apptsRes, emergencyRes] = await Promise.all([
+    fetch(`${SUPABASE_URL}/rest/v1/patients?status=in.(waiting,running_late)&order=queue_number.asc&select=*`, { headers }),
     fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.done&created_at=gte.${today}T00:00:00&select=id`, { headers }),
     fetch(`${SUPABASE_URL}/rest/v1/patients?created_at=gte.${today}T00:00:00&select=id`, { headers }),
-    fetch(`${SUPABASE_URL}/rest/v1/appointments?status=eq.confirmed&order=created_at.asc&select=*`, { headers })
+    fetch(`${SUPABASE_URL}/rest/v1/appointments?status=eq.confirmed&order=created_at.asc&select=*`, { headers }),
+    fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.emergency&order=created_at.asc&select=*`, { headers })
   ]);
 
   const patients = await waitingRes.json();
   const doneToday = await doneRes.json();
   const allToday = await allTodayRes.json();
   const appointments = await apptsRes.json();
+  const emergencies = await emergencyRes.json();
+
+  const emergencyCards = emergencies.map(p => `
+    <div class="patient-card emergency-card" id="card-${p.id}">
+      <div class="card-header"><span class="queue-num">🚨</span><span class="badge emergency">EMERGENCY</span></div>
+      <div class="patient-name">${p.name || 'Unknown'}</div>
+      <div class="patient-info">📞 ${p.phone.replace('whatsapp:', '')}</div>
+      <div class="patient-info">🩺 ${p.reason || '—'}</div>
+      <div class="patient-info">🕐 ${new Date(p.created_at).toLocaleTimeString()}</div>
+      <button class="done-btn emergency-btn" onclick="markDone(${p.id})">✅ Emergency Seen</button>
+    </div>`).join('');
 
   const queueCards = patients.map((p, i) => {
     const waitMins = i * MINUTES_PER_PATIENT;
-    const badge = waitMins === 0 ? '<span class="badge next">🟢 Next</span>' : `<span class="badge wait">~${waitMins} mins</span>`;
+    const isLate = p.status === 'running_late';
+    const badge = waitMins === 0
+      ? '<span class="badge next">🟢 Next</span>'
+      : `<span class="badge wait">~${waitMins} mins</span>`;
+    const lateBadge = isLate ? '<span class="badge late">⏰ Late</span>' : '';
     return `
-    <div class="patient-card" id="card-${p.id}">
-      <div class="card-header"><span class="queue-num">#${p.queue_number}</span>${badge}</div>
+    <div class="patient-card${isLate ? ' late-card' : ''}" id="card-${p.id}">
+      <div class="card-header"><span class="queue-num">#${p.queue_number}</span><div>${badge}${lateBadge}</div></div>
       <div class="patient-name">${p.name || 'Unknown'}</div>
       <div class="patient-info">📞 ${p.phone.replace('whatsapp:', '')}</div>
       <div class="patient-info">🩺 ${p.reason || '—'}</div>
@@ -243,21 +332,26 @@ app.get('/doctor', async (req, res) => {
     .stat { background: white; border-radius: 12px; padding: 14px; text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
     .stat .num { font-size: 28px; font-weight: 700; }
     .stat .lbl { font-size: 11px; color: #718096; margin-top: 2px; }
-    .blue { color: #3182ce; } .orange { color: #dd6b20; } .green { color: #38a169; } .gray { color: #4a5568; }
+    .blue{color:#3182ce} .orange{color:#dd6b20} .green{color:#38a169} .gray{color:#4a5568} .red{color:#e53e3e}
     .section-title { font-size: 13px; font-weight: 600; color: #718096; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; margin-top: 20px; }
     .patient-card { background: white; border-radius: 14px; padding: 16px; margin-bottom: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    .emergency-card { border-left: 4px solid #e53e3e; background: #fff5f5; }
+    .late-card { border-left: 4px solid #ed8936; }
     .appt-card { border-left: 4px solid #805ad5; }
-    .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; gap: 6px; flex-wrap: wrap; }
     .queue-num { font-size: 22px; font-weight: 800; color: #2d3748; }
-    .badge { font-size: 12px; padding: 4px 10px; border-radius: 20px; font-weight: 600; }
+    .badge { font-size: 11px; padding: 3px 8px; border-radius: 20px; font-weight: 600; }
     .badge.next { background: #c6f6d5; color: #276749; }
     .badge.wait { background: #feebc8; color: #9c4221; }
+    .badge.late { background: #feebc8; color: #9c4221; margin-left: 4px; }
     .badge.appt { background: #e9d8fd; color: #553c9a; }
+    .badge.emergency { background: #fed7d7; color: #9b2c2c; }
     .patient-name { font-size: 18px; font-weight: 700; color: #1a202c; margin-bottom: 6px; }
     .patient-info { font-size: 13px; color: #718096; margin-bottom: 3px; }
     .done-btn { margin-top: 14px; width: 100%; padding: 14px; background: #38a169; color: white; border: none; border-radius: 10px; font-size: 16px; font-weight: 600; cursor: pointer; }
     .appt-btn { background: #805ad5; }
-    .empty { text-align: center; padding: 40px 20px; color: #a0aec0; font-size: 15px; }
+    .emergency-btn { background: #e53e3e; }
+    .empty { text-align: center; padding: 30px 20px; color: #a0aec0; font-size: 14px; }
   </style>
 </head>
 <body>
@@ -268,8 +362,10 @@ app.get('/doctor', async (req, res) => {
     <div class="stat"><div class="num blue">${allToday.length}</div><div class="lbl">Total Today</div></div>
     <div class="stat"><div class="num orange">${patients.length}</div><div class="lbl">Waiting Now</div></div>
     <div class="stat"><div class="num green">${doneToday.length}</div><div class="lbl">Seen Today</div></div>
-    <div class="stat"><div class="num gray">${appointments.length}</div><div class="lbl">Appointments</div></div>
+    <div class="stat"><div class="num red">${emergencies.length}</div><div class="lbl">Emergencies</div></div>
   </div>
+
+  ${emergencies.length > 0 ? `<div class="section-title">🚨 Emergencies</div>${emergencyCards}` : ''}
 
   <div class="section-title">🚶 Walk-in Queue</div>
   ${queueCards || '<div class="empty">No walk-in patients right now 🎉</div>'}
@@ -296,6 +392,4 @@ app.get('/doctor', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Bot running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Bot running on port ${PORT}`));
