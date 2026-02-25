@@ -43,7 +43,6 @@ app.post('/webhook', async (req, res) => {
   let reply = '';
 
   try {
-    // Already in waiting queue
     const waiting = await getPatientByStatus(from, 'waiting');
     if (waiting) {
       const aheadRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&queue_number=lt.${waiting.queue_number}&select=id`, { headers });
@@ -53,17 +52,13 @@ app.post('/webhook', async (req, res) => {
         ? `Hi *${waiting.name}*! 🏥 You are *next in line* (number *${waiting.queue_number}*). Please be ready!`
         : `Hi *${waiting.name}*! 🏥 You are number *${waiting.queue_number}* in the queue.\n\nEstimated wait: *~${waitMinutes} minutes*. We'll notify you when it's your turn!`;
 
-    // Waiting for reason for visit
     } else if (await getPatientByStatus(from, 'pending_reason')) {
       const pending = await getPatientByStatus(from, 'pending_reason');
-
-      // Count waiting patients for queue number
       const countRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&select=id`, { headers });
       const waitingList = await countRes.json();
       const queueNumber = waitingList.length + 1;
       const waitMinutes = waitingList.length * MINUTES_PER_PATIENT;
 
-      // Confirm into queue with reason
       await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&status=eq.pending_reason`, {
         method: 'PATCH',
         headers,
@@ -71,12 +66,10 @@ app.post('/webhook', async (req, res) => {
       });
 
       reply = waitMinutes === 0
-        ? `Thank you, *${pending.name}*! 🏥 You are number *${queueNumber}* in the queue — you're next! Please be ready.`
+        ? `Thank you, *${pending.name}*! 🏥 You are number *${queueNumber}* — you're next! Please be ready.`
         : `Thank you, *${pending.name}*! 🏥 You are number *${queueNumber}* in the queue.\n\nEstimated wait: *~${waitMinutes} minutes*. We'll notify you when it's your turn!`;
 
-    // Waiting for name
     } else if (await getPatientByStatus(from, 'pending_name')) {
-      // Save name, now ask for reason
       await fetch(`${SUPABASE_URL}/rest/v1/patients?phone=eq.${encodeURIComponent(from)}&status=eq.pending_name`, {
         method: 'PATCH',
         headers,
@@ -84,7 +77,6 @@ app.post('/webhook', async (req, res) => {
       });
       reply = `Thank you, *${msg}*! 😊\n\nPlease reply with your *reason for visit* (e.g. fever, checkup, follow-up):`;
 
-    // Brand new patient
     } else {
       await fetch(`${SUPABASE_URL}/rest/v1/patients`, {
         method: 'POST',
@@ -107,7 +99,6 @@ app.post('/webhook', async (req, res) => {
   res.send(response);
 });
 
-// Mark done and notify next
 app.post('/done', async (req, res) => {
   const { id } = req.body;
 
@@ -128,10 +119,23 @@ app.post('/done', async (req, res) => {
   res.json({ success: true });
 });
 
-// Doctor panel
 app.get('/doctor', async (req, res) => {
-  const result = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&order=queue_number.asc&select=*`, { headers });
-  const patients = await result.json();
+  const today = new Date().toISOString().split('T')[0];
+
+  // Get today's stats
+  const [waitingRes, doneRes, allTodayRes] = await Promise.all([
+    fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&order=queue_number.asc&select=*`, { headers }),
+    fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.done&created_at=gte.${today}T00:00:00&select=id`, { headers }),
+    fetch(`${SUPABASE_URL}/rest/v1/patients?created_at=gte.${today}T00:00:00&select=id`, { headers })
+  ]);
+
+  const patients = await waitingRes.json();
+  const doneToday = await doneRes.json();
+  const allToday = await allTodayRes.json();
+
+  const totalSeen = doneToday.length;
+  const totalWaiting = patients.length;
+  const totalToday = allToday.length;
 
   const rows = patients.map((p, i) => {
     const waitMins = i * MINUTES_PER_PATIENT;
@@ -155,18 +159,45 @@ app.get('/doctor', async (req, res) => {
   <style>
     body { font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5; }
     h1 { color: #2c3e50; }
+    .stats { display: flex; gap: 16px; margin-bottom: 24px; }
+    .stat-card { background: white; border-radius: 8px; padding: 16px 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center; min-width: 140px; }
+    .stat-card .number { font-size: 36px; font-weight: bold; color: #2c3e50; }
+    .stat-card .label { font-size: 13px; color: #888; margin-top: 4px; }
+    .stat-card.green .number { color: #27ae60; }
+    .stat-card.orange .number { color: #e67e22; }
+    .stat-card.blue .number { color: #2980b9; }
     table { width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
     th { background: #2c3e50; color: white; padding: 12px; text-align: left; }
     td { padding: 12px; border-bottom: 1px solid #eee; }
     tr:hover { background: #f9f9f9; }
     button { background: #27ae60; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: 14px; }
     button:hover { background: #219a52; }
-    .count { font-size: 18px; margin-bottom: 16px; color: #555; }
+    .date { color: #888; font-size: 14px; margin-bottom: 16px; }
   </style>
 </head>
 <body>
   <h1>🏥 Clinic Queue — Doctor Panel</h1>
-  <div class="count">Patients waiting: <strong>${patients.length}</strong> &nbsp;|&nbsp; Auto-refreshes every 15 seconds</div>
+  <div class="date">📅 ${new Date().toLocaleDateString('en-IN', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })} &nbsp;|&nbsp; Auto-refreshes every 15 seconds</div>
+
+  <div class="stats">
+    <div class="stat-card blue">
+      <div class="number">${totalToday}</div>
+      <div class="label">Total Today</div>
+    </div>
+    <div class="stat-card orange">
+      <div class="number">${totalWaiting}</div>
+      <div class="label">Currently Waiting</div>
+    </div>
+    <div class="stat-card green">
+      <div class="number">${totalSeen}</div>
+      <div class="label">Seen Today</div>
+    </div>
+    <div class="stat-card">
+      <div class="number">${totalWaiting * MINUTES_PER_PATIENT}</div>
+      <div class="label">Max Wait (mins)</div>
+    </div>
+  </div>
+
   <table>
     <thead>
       <tr><th>#</th><th>Name</th><th>Phone</th><th>Reason</th><th>Arrived</th><th>Est. Wait</th><th>Action</th></tr>
@@ -175,6 +206,7 @@ app.get('/doctor', async (req, res) => {
       ${rows || '<tr><td colspan="7" style="text-align:center;padding:40px;color:#999">No patients waiting 🎉</td></tr>'}
     </tbody>
   </table>
+
   <script>
     async function markDone(id) {
       await fetch('/done', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id }) });
