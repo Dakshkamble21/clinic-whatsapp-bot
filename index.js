@@ -10,7 +10,6 @@ const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZ
 const TWILIO_SID = 'AC22dd13eb357286b3b06c6f88b41cb6ec';
 const TWILIO_TOKEN = process.env.TWILIO_TOKEN;
 const TWILIO_FROM = 'whatsapp:+14155238886';
-
 const MINUTES_PER_PATIENT = 10;
 
 const headers = {
@@ -101,7 +100,6 @@ app.post('/webhook', async (req, res) => {
 
 app.post('/done', async (req, res) => {
   const { id } = req.body;
-
   await fetch(`${SUPABASE_URL}/rest/v1/patients?id=eq.${id}`, {
     method: 'PATCH',
     headers,
@@ -122,7 +120,6 @@ app.post('/done', async (req, res) => {
 app.get('/doctor', async (req, res) => {
   const today = new Date().toISOString().split('T')[0];
 
-  // Get today's stats
   const [waitingRes, doneRes, allTodayRes] = await Promise.all([
     fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.waiting&order=queue_number.asc&select=*`, { headers }),
     fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.done&created_at=gte.${today}T00:00:00&select=id`, { headers }),
@@ -133,84 +130,77 @@ app.get('/doctor', async (req, res) => {
   const doneToday = await doneRes.json();
   const allToday = await allTodayRes.json();
 
-  const totalSeen = doneToday.length;
-  const totalWaiting = patients.length;
-  const totalToday = allToday.length;
-
-  const rows = patients.map((p, i) => {
+  const cards = patients.map((p, i) => {
     const waitMins = i * MINUTES_PER_PATIENT;
+    const waitLabel = waitMins === 0 ? '<span class="badge next">🟢 Next</span>' : `<span class="badge wait">~${waitMins} mins</span>`;
     return `
-    <tr id="row-${p.id}">
-      <td>${p.queue_number}</td>
-      <td>${p.name || 'Unknown'}</td>
-      <td>${p.phone.replace('whatsapp:', '')}</td>
-      <td>${p.reason || '—'}</td>
-      <td>${new Date(p.created_at).toLocaleTimeString()}</td>
-      <td>${waitMins === 0 ? '🟢 Next' : `~${waitMins} mins`}</td>
-      <td><button onclick="markDone(${p.id})">✅ Done</button></td>
-    </tr>`;
+    <div class="patient-card" id="card-${p.id}">
+      <div class="card-header">
+        <span class="queue-num">#${p.queue_number}</span>
+        ${waitLabel}
+      </div>
+      <div class="patient-name">${p.name || 'Unknown'}</div>
+      <div class="patient-info">📞 ${p.phone.replace('whatsapp:', '')}</div>
+      <div class="patient-info">🩺 ${p.reason || '—'}</div>
+      <div class="patient-info">🕐 Arrived: ${new Date(p.created_at).toLocaleTimeString()}</div>
+      <button class="done-btn" onclick="markDone(${p.id})">✅ Done — Call Next</button>
+    </div>`;
   }).join('');
 
   res.send(`<!DOCTYPE html>
 <html>
 <head>
-  <title>Clinic Doctor Panel</title>
+  <title>Clinic Panel</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="refresh" content="15">
   <style>
-    body { font-family: Arial, sans-serif; padding: 20px; background: #f5f5f5; }
-    h1 { color: #2c3e50; }
-    .stats { display: flex; gap: 16px; margin-bottom: 24px; }
-    .stat-card { background: white; border-radius: 8px; padding: 16px 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center; min-width: 140px; }
-    .stat-card .number { font-size: 36px; font-weight: bold; color: #2c3e50; }
-    .stat-card .label { font-size: 13px; color: #888; margin-top: 4px; }
-    .stat-card.green .number { color: #27ae60; }
-    .stat-card.orange .number { color: #e67e22; }
-    .stat-card.blue .number { color: #2980b9; }
-    table { width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-    th { background: #2c3e50; color: white; padding: 12px; text-align: left; }
-    td { padding: 12px; border-bottom: 1px solid #eee; }
-    tr:hover { background: #f9f9f9; }
-    button { background: #27ae60; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: 14px; }
-    button:hover { background: #219a52; }
-    .date { color: #888; font-size: 14px; margin-bottom: 16px; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f0f4f8; padding: 16px; }
+    h1 { font-size: 20px; color: #1a202c; margin-bottom: 4px; }
+    .date { font-size: 12px; color: #718096; margin-bottom: 16px; }
+    .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 20px; }
+    .stat { background: white; border-radius: 12px; padding: 14px; text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+    .stat .num { font-size: 28px; font-weight: 700; }
+    .stat .lbl { font-size: 11px; color: #718096; margin-top: 2px; }
+    .blue { color: #3182ce; }
+    .orange { color: #dd6b20; }
+    .green { color: #38a169; }
+    .gray { color: #4a5568; }
+    .patient-card { background: white; border-radius: 14px; padding: 16px; margin-bottom: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    .queue-num { font-size: 22px; font-weight: 800; color: #2d3748; }
+    .badge { font-size: 12px; padding: 4px 10px; border-radius: 20px; font-weight: 600; }
+    .badge.next { background: #c6f6d5; color: #276749; }
+    .badge.wait { background: #feebc8; color: #9c4221; }
+    .patient-name { font-size: 18px; font-weight: 700; color: #1a202c; margin-bottom: 6px; }
+    .patient-info { font-size: 13px; color: #718096; margin-bottom: 3px; }
+    .done-btn { margin-top: 14px; width: 100%; padding: 14px; background: #38a169; color: white; border: none; border-radius: 10px; font-size: 16px; font-weight: 600; cursor: pointer; }
+    .done-btn:active { background: #2f855a; }
+    .empty { text-align: center; padding: 60px 20px; color: #a0aec0; font-size: 16px; }
+    .section-title { font-size: 13px; font-weight: 600; color: #718096; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
   </style>
 </head>
 <body>
-  <h1>🏥 Clinic Queue — Doctor Panel</h1>
-  <div class="date">📅 ${new Date().toLocaleDateString('en-IN', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })} &nbsp;|&nbsp; Auto-refreshes every 15 seconds</div>
+  <h1>🏥 Clinic Queue</h1>
+  <div class="date">📅 ${new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long' })} · Auto-refreshes every 15s</div>
 
   <div class="stats">
-    <div class="stat-card blue">
-      <div class="number">${totalToday}</div>
-      <div class="label">Total Today</div>
-    </div>
-    <div class="stat-card orange">
-      <div class="number">${totalWaiting}</div>
-      <div class="label">Currently Waiting</div>
-    </div>
-    <div class="stat-card green">
-      <div class="number">${totalSeen}</div>
-      <div class="label">Seen Today</div>
-    </div>
-    <div class="stat-card">
-      <div class="number">${totalWaiting * MINUTES_PER_PATIENT}</div>
-      <div class="label">Max Wait (mins)</div>
-    </div>
+    <div class="stat"><div class="num blue">${allToday.length}</div><div class="lbl">Total Today</div></div>
+    <div class="stat"><div class="num orange">${patients.length}</div><div class="lbl">Waiting Now</div></div>
+    <div class="stat"><div class="num green">${doneToday.length}</div><div class="lbl">Seen Today</div></div>
+    <div class="stat"><div class="num gray">${patients.length * MINUTES_PER_PATIENT}</div><div class="lbl">Max Wait (mins)</div></div>
   </div>
 
-  <table>
-    <thead>
-      <tr><th>#</th><th>Name</th><th>Phone</th><th>Reason</th><th>Arrived</th><th>Est. Wait</th><th>Action</th></tr>
-    </thead>
-    <tbody>
-      ${rows || '<tr><td colspan="7" style="text-align:center;padding:40px;color:#999">No patients waiting 🎉</td></tr>'}
-    </tbody>
-  </table>
+  <div class="section-title">Patients in Queue</div>
+  ${cards || '<div class="empty">🎉 No patients waiting right now!</div>'}
 
   <script>
     async function markDone(id) {
+      const btn = document.querySelector('#card-' + id + ' .done-btn');
+      btn.textContent = 'Processing...';
+      btn.disabled = true;
       await fetch('/done', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id }) });
-      document.getElementById('row-' + id).remove();
+      document.getElementById('card-' + id).remove();
     }
   </script>
 </body>
