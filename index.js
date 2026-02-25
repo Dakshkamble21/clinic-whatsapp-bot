@@ -1,4 +1,5 @@
 const express = require('express');
+const cron = require('node-cron');
 const app = express();
 
 app.use(express.urlencoded({ extended: false }));
@@ -11,6 +12,9 @@ const TWILIO_SID = 'AC22dd13eb357286b3b06c6f88b41cb6ec';
 const TWILIO_TOKEN = process.env.TWILIO_TOKEN;
 const TWILIO_FROM = 'whatsapp:+14155238886';
 const MINUTES_PER_PATIENT = 10;
+
+// ⬇️ Doctor's WhatsApp number — change this to the doctor's real number
+const DOCTOR_PHONE = 'whatsapp:+918839775527';
 
 const headers = {
   'apikey': SUPABASE_KEY,
@@ -81,6 +85,70 @@ async function notifyAllWaiting(message) {
   const patients = await res.json();
   for (const p of patients) await sendWhatsApp(p.phone, message);
 }
+
+// ─── Daily Report ───────────────────────────────────────────
+async function sendDailyReport() {
+  const today = new Date().toISOString().split('T')[0];
+
+  const [allRes, doneRes, cancelledRes, emergencyRes, apptsRes] = await Promise.all([
+    fetch(`${SUPABASE_URL}/rest/v1/patients?created_at=gte.${today}T00:00:00&select=*`, { headers }),
+    fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.done&created_at=gte.${today}T00:00:00&select=*`, { headers }),
+    fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.cancelled&created_at=gte.${today}T00:00:00&select=id`, { headers }),
+    fetch(`${SUPABASE_URL}/rest/v1/patients?status=eq.emergency&created_at=gte.${today}T00:00:00&select=id`, { headers }),
+    fetch(`${SUPABASE_URL}/rest/v1/appointments?created_at=gte.${today}T00:00:00&status=eq.done&select=id`, { headers })
+  ]);
+
+  const all = await allRes.json();
+  const done = await doneRes.json();
+  const cancelled = await cancelledRes.json();
+  const emergencies = await emergencyRes.json();
+  const apptsDone = await apptsRes.json();
+
+  // Top reasons
+  const reasonCount = {};
+  for (const p of done) {
+    if (p.reason) {
+      const r = p.reason.toLowerCase().trim();
+      reasonCount[r] = (reasonCount[r] || 0) + 1;
+    }
+  }
+  const topReasons = Object.entries(reasonCount)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([r, c], i) => `  ${i + 1}. ${r} (${c}x)`)
+    .join('\n');
+
+  const dateStr = new Date().toLocaleDateString('en-IN', {
+    weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'
+  });
+
+  const report = `📊 *Daily Clinic Report*
+📅 ${dateStr}
+
+👥 *Total registered:* ${all.length}
+✅ *Patients seen:* ${done.length}
+📅 *Appointments done:* ${apptsDone.length}
+❌ *Cancelled/No-show:* ${cancelled.length}
+🚨 *Emergencies:* ${emergencies.length}
+
+${topReasons ? `🩺 *Top reasons for visit:*\n${topReasons}` : ''}
+
+${done.length > 0 ? `💪 Great work today! See you tomorrow.` : `📋 No patients were seen today.`}`;
+
+  await sendWhatsApp(DOCTOR_PHONE, report);
+  console.log('Daily report sent at', new Date().toISOString());
+}
+
+// ─── Schedule: runs every day at 9:00 PM IST (15:30 UTC) ───
+cron.schedule('30 15 * * *', () => {
+  sendDailyReport().catch(console.error);
+});
+
+// Manual trigger endpoint (for testing)
+app.post('/report/send', async (req, res) => {
+  await sendDailyReport();
+  res.json({ success: true, message: 'Report sent!' });
+});
 
 // ─── WhatsApp Webhook ───────────────────────────────────────
 app.post('/webhook', async (req, res) => {
@@ -202,7 +270,7 @@ app.post('/webhook', async (req, res) => {
                 method: 'POST', headers: { ...headers, 'Prefer': 'return=representation' },
                 body: JSON.stringify({ phone: from, status: 'emergency', queue_number: 0, name: 'Emergency Patient' })
               });
-              reply = `🚨 *Emergency registered!*\n\nPlease come to the clinic immediately. The doctor has been alerted.\n\nIf life-threatening, call *112* right away.`;
+              reply = `🚨 *Emergency registered!*\n\nPlease come to the clinic immediately.\n\nIf life-threatening, call *112* right away.`;
             }
           } else if (msgLower === 'menu' || msgLower === 'hi' || msgLower === 'hello' || msgLower === 'start' || msg === '0') {
             reply = MAIN_MENU;
@@ -256,8 +324,7 @@ app.post('/session/reset', async (req, res) => {
 app.post('/done', async (req, res) => {
   const { id, staffName } = req.body;
   await fetch(`${SUPABASE_URL}/rest/v1/patients?id=eq.${id}`, {
-    method: 'PATCH', headers,
-    body: JSON.stringify({ status: 'done', handled_by: staffName || 'Staff' })
+    method: 'PATCH', headers, body: JSON.stringify({ status: 'done', handled_by: staffName || 'Staff' })
   });
   const nextRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=in.(waiting,running_late)&order=queue_number.asc&limit=1&select=*`, { headers });
   const next = await nextRes.json();
@@ -273,14 +340,11 @@ app.post('/skip', async (req, res) => {
   const patients = await patRes.json();
   if (patients.length === 0) return res.json({ success: false });
   const skipped = patients[0];
-
   const maxRes = await fetch(`${SUPABASE_URL}/rest/v1/patients?status=in.(waiting,running_late)&order=queue_number.desc&limit=1&select=queue_number`, { headers });
   const maxData = await maxRes.json();
   const newQueueNumber = maxData.length > 0 ? maxData[0].queue_number + 1 : skipped.queue_number;
-
   await fetch(`${SUPABASE_URL}/rest/v1/patients?id=eq.${id}`, {
-    method: 'PATCH', headers,
-    body: JSON.stringify({ queue_number: newQueueNumber, status: 'waiting', skipped_by: staffName || 'Staff' })
+    method: 'PATCH', headers, body: JSON.stringify({ queue_number: newQueueNumber, status: 'waiting', skipped_by: staffName || 'Staff' })
   });
   await sendWhatsApp(skipped.phone,
     `⏭️ *${skipped.name}*, you were skipped as you weren't present.\n\nYou've been moved to *#${newQueueNumber}* in the queue.\n\nPlease come to the clinic soon! Reply *2* to check your updated wait time. 🏥`
@@ -301,20 +365,19 @@ app.post('/appt-done', async (req, res) => {
   res.json({ success: true });
 });
 
-// ─── Staff API (who's online) ───────────────────────────────
+// ─── Staff ──────────────────────────────────────────────────
 app.post('/staff/ping', async (req, res) => {
   const { name } = req.body;
   if (!name) return res.json({ success: false });
   await fetch(`${SUPABASE_URL}/rest/v1/staff_online`, {
-    method: 'POST',
-    headers: { ...headers, 'Prefer': 'resolution=merge-duplicates' },
+    method: 'POST', headers: { ...headers, 'Prefer': 'resolution=merge-duplicates' },
     body: JSON.stringify({ name, last_seen: new Date().toISOString() })
   }).catch(() => {});
   res.json({ success: true });
 });
 
 app.get('/staff/online', async (req, res) => {
-  const cutoff = new Date(Date.now() - 2 * 60 * 1000).toISOString(); // 2 min ago
+  const cutoff = new Date(Date.now() - 2 * 60 * 1000).toISOString();
   const result = await fetch(`${SUPABASE_URL}/rest/v1/staff_online?last_seen=gte.${cutoff}&select=name,last_seen`, { headers })
     .then(r => r.json()).catch(() => []);
   res.json(result);
@@ -403,27 +466,23 @@ app.get('/doctor', async (req, res) => {
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f0f4f8; padding: 16px; }
     h1 { font-size: 20px; color: #1a202c; margin-bottom: 2px; }
     .date { font-size: 12px; color: #718096; margin-bottom: 12px; }
-
-    /* Staff bar */
     .staff-bar { background: white; border-radius: 12px; padding: 12px 16px; margin-bottom: 16px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .staff-label { font-size: 12px; color: #718096; }
     .staff-name { font-size: 14px; font-weight: 700; color: #2d3748; }
     .staff-change { font-size: 12px; color: #3182ce; cursor: pointer; text-decoration: underline; }
     .online-dots { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
     .dot { font-size: 11px; background: #c6f6d5; color: #276749; padding: 3px 8px; border-radius: 20px; font-weight: 600; }
-
+    .report-btn { background: #3182ce; color: white; border: none; border-radius: 8px; padding: 8px 14px; font-size: 13px; font-weight: 600; cursor: pointer; margin-left: auto; }
     .session-box { background: white; border-radius: 14px; padding: 16px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
     .session-status { font-size: 20px; font-weight: 800; color: ${statusColor[session.status]}; margin-bottom: 10px; }
     .session-btns { display: flex; gap: 10px; flex-wrap: wrap; }
     .sess-btn { flex: 1; min-width: 120px; padding: 13px; border: none; border-radius: 10px; font-size: 14px; font-weight: 600; cursor: pointer; color: white; }
     .sess-btn.green{background:#38a169} .sess-btn.orange{background:#dd6b20} .sess-btn.red{background:#e53e3e} .sess-btn.gray{background:#718096}
-
     .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 16px; }
     .stat { background: white; border-radius: 12px; padding: 14px; text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
     .stat .num { font-size: 28px; font-weight: 700; }
     .stat .lbl { font-size: 11px; color: #718096; margin-top: 2px; }
     .blue{color:#3182ce} .orange{color:#dd6b20} .green{color:#38a169} .red{color:#e53e3e}
-
     .section-title { font-size: 13px; font-weight: 600; color: #718096; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; margin-top: 16px; }
     .patient-card { background: white; border-radius: 14px; padding: 16px; margin-bottom: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
     .emergency-card { border-left: 4px solid #e53e3e; background: #fff5f5; }
@@ -450,7 +509,6 @@ app.get('/doctor', async (req, res) => {
   <h1>🏥 Clinic Panel</h1>
   <div class="date">📅 ${new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long' })}</div>
 
-  <!-- Staff identity bar -->
   <div class="staff-bar">
     <div>
       <div class="staff-label">Logged in as</div>
@@ -458,6 +516,7 @@ app.get('/doctor', async (req, res) => {
     </div>
     <span class="staff-change" onclick="changeName()">Change</span>
     <div class="online-dots" id="onlineDots"></div>
+    <button class="report-btn" onclick="sendReport()">📊 Send Report Now</button>
   </div>
 
   <div class="session-box">
@@ -480,11 +539,10 @@ app.get('/doctor', async (req, res) => {
   <div class="refresh-info">Auto-refreshes every 15s</div>
 
   <script>
-    // ── Staff name management ──
     function getMyName() {
       let name = localStorage.getItem('clinicStaffName');
       if (!name) {
-        name = prompt('Welcome! Enter your name (e.g. Dr. Sharma, Nurse Priya, Reception):') || 'Staff';
+        name = prompt('Welcome! Enter your name (e.g. Dr. Sharma, Nurse Priya):') || 'Staff';
         localStorage.setItem('clinicStaffName', name);
       }
       return name;
@@ -493,29 +551,31 @@ app.get('/doctor', async (req, res) => {
       const name = prompt('Enter your new name:');
       if (name) { localStorage.setItem('clinicStaffName', name); location.reload(); }
     }
-
     const myName = getMyName();
     document.getElementById('myName').textContent = myName;
 
-    // ── Ping server every 30s to show as online ──
     async function pingOnline() {
       await fetch('/staff/ping', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ name: myName }) });
     }
     pingOnline();
     setInterval(pingOnline, 30000);
 
-    // ── Show who's online ──
     async function loadOnline() {
       const staff = await fetch('/staff/online').then(r => r.json()).catch(() => []);
-      const dots = document.getElementById('onlineDots');
-      dots.innerHTML = staff.map(s => \`<span class="dot">🟢 \${s.name}</span>\`).join('');
+      document.getElementById('onlineDots').innerHTML = staff.map(s => \`<span class="dot">🟢 \${s.name}</span>\`).join('');
     }
     loadOnline();
 
-    // ── Auto-refresh every 15s ──
+    async function sendReport() {
+      const btn = event.target;
+      btn.textContent = 'Sending...'; btn.disabled = true;
+      await fetch('/report/send', { method: 'POST', headers: {'Content-Type':'application/json'} });
+      btn.textContent = '✅ Sent!';
+      setTimeout(() => { btn.textContent = '📊 Send Report Now'; btn.disabled = false; }, 3000);
+    }
+
     setInterval(() => location.reload(), 15000);
 
-    // ── Actions ──
     async function sessionAction(action) {
       const btn = event.target;
       btn.disabled = true; btn.textContent = 'Please wait...';
@@ -539,7 +599,7 @@ app.get('/doctor', async (req, res) => {
     async function apptDone(id) {
       const btn = document.querySelector('#appt-' + id + ' .done-btn');
       btn.textContent = 'Processing...'; btn.disabled = true;
-      await fetch('/appt-done', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id, staffName: myName }) });
+      await fetch('/appt-done', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id }) });
       document.getElementById('appt-' + id).remove();
     }
   </script>
